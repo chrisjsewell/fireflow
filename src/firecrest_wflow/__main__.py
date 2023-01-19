@@ -4,67 +4,82 @@ from __future__ import annotations
 import asyncio
 import logging
 from pathlib import Path
-from pprint import pprint
 from tempfile import TemporaryDirectory
 from textwrap import dedent
 import time
-from typing import TypedDict
+from typing import Any, TypedDict
 from urllib.parse import urlparse
 
 import aiofiles
 import aiohttp
 import firecrest
 
-from firecrest_wflow.data import CalcNode, Computer, Data
+from firecrest_wflow.data import Calculation, Computer, DataNode
 from firecrest_wflow.patches import ls_recurse
+from firecrest_wflow.storage import PersistProtocol, SqliteStorage
 
 LOGGER = logging.getLogger(__name__)
 
 
-REMOTE_FOLDER_NAME = "aiida"
+def run_unfinished_calculations(storage: SqliteStorage) -> None:
+    """Run all unfinished calculations."""
+    calcs = storage.get_unfinished()
+    asyncio.run(run_multiple_calculations(calcs, storage))
 
 
 async def run_multiple_calculations(
-    computer: Computer, calcs: list[CalcNode]
-) -> dict[str, list[Data]]:
-    """Run multiple calculations on a remote computer."""
-    return {
-        uid: nodes
-        for uid, nodes in await asyncio.gather(
-            *[run_calculation(computer, calc) for calc in calcs]
-        )
-    }
+    calcs: list[Calculation], persist: PersistProtocol
+) -> None:
+    """Run multiple calculations."""
+    await asyncio.gather(*[run_calculation(calc, persist) for calc in calcs])
 
 
-async def reliquish():
+async def reliquish() -> None:
     """Simple function that relinquishes control to the event loop"""
     await asyncio.sleep(0)
 
 
-async def run_calculation(computer: Computer, calc: CalcNode):
-    """Run a process on a remote computer."""
-
-    with TemporaryDirectory() as in_tmpdir_str:
-        in_tmpdir = Path(in_tmpdir_str)
-        await prepare_for_submission(calc, in_tmpdir)
+async def run_calculation(calc: Calculation, persist: PersistProtocol) -> None:
+    """Run a single calculation."""
+    while calc.status != "finalised":
+        try:
+            await run_step(calc)
+        except Exception as exc:
+            LOGGER.exception("Error running calculation %s", calc.uuid)
+            exc_str = f"{type(exc).__name__}: {exc}"
+            calc.exception = exc_str
+            calc.status = "finalised"
+        persist.save(calc)
         await reliquish()
-        await copy_to_remote(computer, calc, in_tmpdir)
-        await reliquish()
-
-    await submit_on_remote(computer, calc)
-    await reliquish()
-
-    await poll_until_finished(computer, calc)
-    await reliquish()
-
-    with TemporaryDirectory() as out_tmpdir_str:
-        out_tmpdir = Path(out_tmpdir_str)
-        await copy_from_remote(computer, calc, out_tmpdir)
-        await reliquish()
-        return calc.uuid, await parse_output_files(calc, out_tmpdir)
 
 
-async def prepare_for_submission(calc: CalcNode, local_path: Path):
+async def run_step(calc: Calculation) -> None:
+    """Run a single step of a computation."""
+
+    # TODO would like to move this to pattern matching, but ruff does not support it:
+    # https://github.com/charliermarsh/ruff/issues/282
+
+    if calc.status == "created":
+        with TemporaryDirectory() as in_tmpdir:
+            await prepare_for_submission(calc, Path(in_tmpdir))
+            await copy_to_remote(calc, Path(in_tmpdir))
+        calc.status = "uploaded"
+    elif calc.status == "uploaded":
+        await submit_on_remote(calc)
+        calc.status = "submitted"
+    elif calc.status == "submitted":
+        await poll_until_finished(calc)
+        calc.status = "executed"
+    elif calc.status == "executed":
+        with TemporaryDirectory() as out_tmpdir:
+            await copy_from_remote(calc, Path(out_tmpdir))
+            await parse_output_files(calc, Path(out_tmpdir))
+        calc.status = "finalised"
+    else:
+        raise ValueError(f"Unknown status {calc.status}")
+
+
+async def prepare_for_submission(calc: Calculation, local_path: Path) -> None:
     """Prepares the (local) calculation folder with all inputs,
     ready to be copied to the compute resource.
     """
@@ -84,7 +99,7 @@ async def prepare_for_submission(calc: CalcNode, local_path: Path):
 
 async def poll_object_transfer(
     obj: firecrest.ExternalStorage, interval: int = 1, timeout: int | None = 60
-):
+) -> None:
     """Poll until an object  has been transferred to/from the store."""
     start = time.time()
     while obj.in_progress:
@@ -93,9 +108,10 @@ async def poll_object_transfer(
         await asyncio.sleep(interval)
 
 
-async def copy_to_remote(computer: Computer, calc: CalcNode, local_folder: Path):
+async def copy_to_remote(calc: Calculation, local_folder: Path) -> None:
     """Copy the calculation inputs to the compute resource."""
-    remote_folder = computer.work_path / REMOTE_FOLDER_NAME / calc.uuid
+    computer = calc.computer
+    remote_folder = calc.remote_path
     LOGGER.info("copying to remote folder: %s", remote_folder)
     client = computer.client
     client.mkdir(computer.machine_name, str(remote_folder), p=True)
@@ -125,11 +141,13 @@ async def copy_to_remote(computer: Computer, calc: CalcNode, local_folder: Path)
                 params["url"] = params["url"].replace("192.168.220.19", "localhost")
                 await upload_file_to_url(local_path, params)
                 await poll_object_transfer(up_obj)
+                # TODO invalidate the upload object
 
 
-async def submit_on_remote(computer: Computer, calc: CalcNode):
+async def submit_on_remote(calc: Calculation) -> None:
     """Run the calculation on the compute resource."""
-    script_path = computer.work_path / REMOTE_FOLDER_NAME / calc.uuid / "job.sh"
+    computer = calc.computer
+    script_path = calc.remote_path / "job.sh"
     LOGGER.info("submitting on remote: %s", script_path)
     client = computer.client
     result = client.submit(computer.machine_name, str(script_path), local_file=False)
@@ -137,10 +155,11 @@ async def submit_on_remote(computer: Computer, calc: CalcNode):
 
 
 async def poll_until_finished(
-    computer: Computer, calc: CalcNode, interval: int = 1, timeout: int | None = 60
-):
+    calc: Calculation, interval: int = 1, timeout: int | None = 60
+) -> None:
     """Poll the compute resource until the calculation is finished."""
     LOGGER.info("polling job until finished: %s", calc.uuid)
+    computer = calc.computer
     client = computer.client
     start = time.time()
     while timeout is None or (time.time() - start) < timeout:
@@ -152,9 +171,10 @@ async def poll_until_finished(
         raise RuntimeError("timeout waiting for calculation to finish")
 
 
-async def copy_from_remote(computer: Computer, calc: CalcNode, local_folder: Path):
+async def copy_from_remote(calc: Calculation, local_folder: Path) -> None:
     """Copy the calculation outputs from the compute resource."""
-    remote_folder = computer.work_path / REMOTE_FOLDER_NAME / calc.uuid
+    computer = calc.computer
+    remote_folder = calc.remote_path
     LOGGER.info("copying from remote folder: %s", remote_folder)
     client = computer.client
     for item in ls_recurse(
@@ -195,9 +215,10 @@ async def copy_from_remote(computer: Computer, calc: CalcNode, local_folder: Pat
                     + urlparse(url).path
                 )
                 await copy_file_async(store_path, local_path)
+                # TODO invalidate the download object
 
 
-async def parse_output_files(calc: CalcNode, local_path: Path) -> list[Data]:
+async def parse_output_files(calc: Calculation, local_path: Path) -> None:
     """Parse the calculation outputs."""
     LOGGER.info("parsing output files: %s", local_path)
     paths = []
@@ -205,13 +226,13 @@ async def parse_output_files(calc: CalcNode, local_path: Path) -> list[Data]:
         paths.append(
             path.relative_to(local_path).as_posix() + ("/" if path.is_dir() else "")
         )
-    return [Data(attributes={"paths": paths})]
+    DataNode(creator=calc, attributes={"paths": paths})
 
 
 # HELPER functions
 
 
-async def copy_file_async(src: str | Path, dest: str | Path):
+async def copy_file_async(src: str | Path, dest: str | Path) -> None:
     """Copy a file asynchronously."""
     async with aiofiles.open(src, mode="rb") as fr, aiofiles.open(
         dest, mode="wb"
@@ -230,7 +251,7 @@ class UploadParameters(TypedDict):
     method: str
     data: dict[str, str]
     headers: dict[str, str]
-    json: dict
+    json: dict[str, Any]
     params: dict[str, str]
 
 
@@ -252,7 +273,7 @@ async def upload_file_to_url(filepath: Path | str, params: UploadParameters) -> 
                 return await resp.text()
 
 
-async def download_url_to_file(url: str, filepath: Path | str):
+async def download_url_to_file(url: str, filepath: Path | str) -> None:
     """Download a file from a URL to a local file."""
     async with aiohttp.ClientSession() as session:
         async with session.get(url) as resp:
@@ -264,7 +285,7 @@ async def download_url_to_file(url: str, filepath: Path | str):
                     f.write(chunk)
 
 
-def main():
+def main() -> None:
     """Run the example."""
     logging.basicConfig(
         format="%(asctime)s:%(name)s:%(levelname)s: %(message)s",
@@ -279,15 +300,32 @@ def main():
         token_uri="http://localhost:8080/auth/realms/kcrealm/protocol/openid-connect/token",
         machine_name="cluster",
         work_dir="/home/service-account-firecrest-sample",
-        small_file_size_mb=0,
+        small_file_size_mb=5,
     )
 
-    calc1 = CalcNode()
-    calc2 = CalcNode()
-    nodes = asyncio.run(run_multiple_calculations(computer, [calc1, calc2]))
-    pprint(nodes)  # noqa: T203
+    calcs = [Calculation(computer=computer)] * 2
+    storage = SqliteStorage(engine_kwargs={"echo": False})
+    storage.save_many(calcs)
+    run_unfinished_calculations(storage)
 
-    # TODO how to remove files from the object store?
+    calc: Calculation
+    for calc in storage._session.query(Calculation):  # type: ignore
+        print(calc)  # noqa: T201
+        print("outputs:")  # noqa: T201
+        for node in calc.outputs:
+            print(node, node.attributes)  # noqa: T201
+
+    # with Session(engine) as session:
+    #     session.add_all(calcs)
+    #     session.commit()
+
+    # with Session(engine) as session:
+    #     calc: Calculation
+    #     for calc in session.query(Calculation):  # type: ignore
+    #         print(calc)  # noqa: T201
+    #         print("outputs:")  # noqa: T201
+    #         for node in calc.outputs:
+    #             print(node, node.attributes)  # noqa: T201
 
 
 if __name__ == "__main__":

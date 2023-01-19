@@ -33,4 +33,5 @@ repos:
         additional_dependencies: [
           "types-aiofiles",
           "aiohttp",
+          "sqlalchemy==2.0.0rc2",
         ]
