@@ -7,7 +7,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from textwrap import dedent
 import time
-from typing import Any, TypedDict
+from typing import Any, Sequence, TypedDict
 from urllib.parse import urlparse
 
 import aiofiles
@@ -28,7 +28,7 @@ def run_unfinished_calculations(storage: SqliteStorage) -> None:
 
 
 async def run_multiple_calculations(
-    calcs: list[Calculation], persist: PersistProtocol
+    calcs: Sequence[Calculation], persist: PersistProtocol
 ) -> None:
     """Run multiple calculations."""
     await asyncio.gather(*[run_calculation(calc, persist) for calc in calcs])
@@ -314,18 +314,6 @@ def main() -> None:
         print("outputs:")  # noqa: T201
         for node in calc.outputs:
             print(node, node.attributes)  # noqa: T201
-
-    # with Session(engine) as session:
-    #     session.add_all(calcs)
-    #     session.commit()
-
-    # with Session(engine) as session:
-    #     calc: Calculation
-    #     for calc in session.query(Calculation):  # type: ignore
-    #         print(calc)  # noqa: T201
-    #         print("outputs:")  # noqa: T201
-    #         for node in calc.outputs:
-    #             print(node, node.attributes)  # noqa: T201
 
 
 if __name__ == "__main__":

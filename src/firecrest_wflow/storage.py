@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Protocol, Sequence
 
 import sqlalchemy as sa
 import sqlalchemy.orm as orm
@@ -52,9 +52,11 @@ class SqliteStorage(PersistProtocol):
         self._session.add_all(calcs)
         self._session.commit()
 
-    def get_unfinished(self, max: None | int = None) -> list[Calculation]:
+    def get_unfinished(self, max: None | int = None) -> Sequence[Calculation]:
         """Get unfinished calculations."""
-        stmt = sa.select(Calculation).where(Calculation.status != "finalised")
+        stmt = sa.select(Calculation).where(
+            Calculation.status != "finalised"  # type: ignore[arg-type]
+        )
         if max is not None:
             stmt = stmt.limit(max)
         return self._session.scalars(stmt).all()

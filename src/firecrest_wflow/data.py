@@ -28,17 +28,17 @@ class Computer:
 
     client_url: str
     # per-user authinfo
-    client_id: str = field(metadata={"sa": sa.Column(sa.String())})
+    client_id: str
     client_secret: str  # note this would not actually be stored in the database
-    token_uri: str = field(metadata={"sa": sa.Column(sa.String())})
-    machine_name: str = field(metadata={"sa": sa.Column(sa.String())})
-    work_dir: str = field(metadata={"sa": sa.Column(sa.String())})
+    token_uri: str
+    machine_name: str
+    work_dir: str
     """The working directory for the user on the remote machine."""
     fsystem: Literal["posix", "windows"] = field(
         default="posix", metadata={"sa": sa.Column(sa.Enum("posix", "windows"))}
     )
     """The file system type on the remote machine."""
-    small_file_size_mb: int = field(default=5, metadata={"sa": sa.Column(sa.Integer)})
+    small_file_size_mb: int = 5
     """The maximum size of a file that can be uploaded directly, in MB."""
 
     # database populated fields
@@ -104,7 +104,7 @@ class Calculation:
     attributes: Dict[str, Any] = field(
         default_factory=dict,
         repr=False,
-        metadata={"sa": sa.Column(MutableDict.as_mutable(sa.JSON))},
+        metadata={"sa": sa.Column(MutableDict.as_mutable(sa.JSON()))},
     )
     """JSONable data to store on the node."""
 
@@ -114,9 +114,7 @@ class Calculation:
     )
     """The status of the calculation."""
 
-    exception: Optional[str] = field(
-        default=None, metadata={"sa": sa.Column(sa.String())}
-    )
+    exception: Optional[str] = None
     """The exception that was raised, if any."""
 
     uuid: str = field(
@@ -166,7 +164,7 @@ class DataNode:
     attributes: Dict[str, Any] = field(
         default_factory=dict,
         repr=False,
-        metadata={"sa": sa.Column(MutableDict.as_mutable(sa.JSON))},
+        metadata={"sa": sa.Column(MutableDict.as_mutable(sa.JSON()))},
     )
     """JSONable data to store on the node."""
 
