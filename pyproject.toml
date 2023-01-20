@@ -18,10 +18,12 @@ dependencies = [
     "pyfirecrest~=1.2.0",
     "aiohttp~=3.8",
     "aiofiles~=22.1",
-    "sqlalchemy==2.0.0rc2"
+    "sqlalchemy==2.0.0rc2",
+    "jinja2"
 ]
 
 [project.optional-dependencies]
+cli = ["click", "pyyaml"]
 testing = ["pytest"]
 
 [project.scripts]
@@ -43,5 +45,10 @@ show_error_codes = true
 strict = true
 
 [[tool.mypy.overrides]]
-module = ["firecrest.*"]
+module = [
+    "firecrest.*",
+    "tomllib.*",
+    "yaml.*",
+    "click_config_file.*",
+]
 ignore_missing_imports = true

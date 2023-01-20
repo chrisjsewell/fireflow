@@ -26,38 +26,38 @@ class Computer:
     __tablename__ = "computer"
     __sa_dataclass_metadata_key__ = "sa"
 
-    client_url: str
+    pk: Optional[int] = field(
+        init=False, metadata={"sa": sa.Column(sa.Integer, primary_key=True)}
+    )
+    client_url: str = field(metadata={"sa": sa.Column(sa.String())})
     # per-user authinfo
-    client_id: str
-    client_secret: str  # note this would not actually be stored in the database
-    token_uri: str
-    machine_name: str
-    work_dir: str
+    client_id: str = field(metadata={"sa": sa.Column(sa.String())})
+    # note this would not actually be stored in the database
+    token_uri: str = field(metadata={"sa": sa.Column(sa.String())})
+    client_secret: str = field(metadata={"sa": sa.Column(sa.String())})
+    machine_name: str = field(metadata={"sa": sa.Column(sa.String())})
+    work_dir: str = field(metadata={"sa": sa.Column(sa.String())})
     """The working directory for the user on the remote machine."""
     fsystem: Literal["posix", "windows"] = field(
         default="posix", metadata={"sa": sa.Column(sa.Enum("posix", "windows"))}
     )
     """The file system type on the remote machine."""
-    small_file_size_mb: int = 5
+    small_file_size_mb: int = field(default=5, metadata={"sa": sa.Column(sa.Integer())})
     """The maximum size of a file that can be uploaded directly, in MB."""
 
-    # database populated fields
-    pk: Optional[int] = field(
-        init=False, metadata={"sa": sa.Column(sa.Integer, primary_key=True)}
-    )
     """The primary key set by the database."""
-    _calculations: List[Calculation] = field(
+    _codes: List[Code] = field(
         init=False,
         default_factory=list,
         repr=False,
-        metadata={"sa": orm.relationship("Calculation")},
+        metadata={"sa": orm.relationship("Code")},
     )
-    """The calculations that are associated with this computer."""
+    """The codes that are associated with this computer."""
 
     @property
-    def calculations(self) -> List[Calculation]:
+    def codes(self) -> List[Code]:
         """Return the outputs of the calculation."""
-        return self._calculations
+        return self._codes
 
     @property
     def work_path(self) -> PurePosixPath | PureWindowsPath:
@@ -85,6 +85,54 @@ class Computer:
         return self._client
 
 
+@mapper_registry.mapped
+@dataclass
+class Code:
+    """Data for a single code."""
+
+    __tablename__ = "code"
+    __sa_dataclass_metadata_key__ = "sa"
+
+    pk: Optional[int] = field(
+        init=False, metadata={"sa": sa.Column(sa.Integer(), primary_key=True)}
+    )
+    """The primary key set by the database."""
+
+    computer: Computer = field(
+        repr=False,
+        metadata={"sa": orm.relationship("Computer", back_populates="_codes")},
+    )
+
+    script: str = field(repr=False, metadata={"sa": sa.Column(sa.String())})
+    """The batch script template to submit to the scheduler on the remote machine.
+
+    This can use the `calc` jinja2 placeholders,
+    and will be prepended by:
+    ```bash
+    #!/bin/bash
+    #SBATCH --job-name={{calc.uuid}}
+    ```
+    """
+
+    computer_pk: Optional[int] = field(
+        init=False, metadata={"sa": sa.Column(sa.ForeignKey("computer.pk"))}
+    )
+    """The primary key of the computer that this calculation is associated with."""
+
+    _calculations: List[Calculation] = field(
+        init=False,
+        default_factory=list,
+        repr=False,
+        metadata={"sa": orm.relationship("Calculation")},
+    )
+    """The calculations that are associated with this code."""
+
+    @property
+    def calculations(self) -> List[Calculation]:
+        """Return the outputs of the calculation."""
+        return self._calculations
+
+
 StatusType = Literal["created", "uploaded", "submitted", "executed", "finalised"]
 
 
@@ -96,9 +144,14 @@ class Calculation:
     __tablename__ = "calculation"
     __sa_dataclass_metadata_key__ = "sa"
 
-    computer: Computer = field(
+    pk: Optional[int] = field(
+        init=False, metadata={"sa": sa.Column(sa.Integer(), primary_key=True)}
+    )
+    """The primary key set by the database."""
+
+    code: Code = field(
         repr=False,
-        metadata={"sa": orm.relationship("Computer", back_populates="_calculations")},
+        metadata={"sa": orm.relationship("Code", back_populates="_calculations")},
     )
 
     attributes: Dict[str, Any] = field(
@@ -114,7 +167,9 @@ class Calculation:
     )
     """The status of the calculation."""
 
-    exception: Optional[str] = None
+    exception: Optional[str] = field(
+        default=None, metadata={"sa": sa.Column(sa.String())}
+    )
     """The exception that was raised, if any."""
 
     uuid: str = field(
@@ -123,14 +178,10 @@ class Calculation:
     )
     """The unique identifier, for remote folder creation."""
 
-    pk: Optional[int] = field(
-        init=False, metadata={"sa": sa.Column(sa.Integer(), primary_key=True)}
+    code_pk: Optional[int] = field(
+        init=False, metadata={"sa": sa.Column(sa.ForeignKey("code.pk"))}
     )
-    """The primary key set by the database."""
-    computer_pk: Optional[int] = field(
-        init=False, metadata={"sa": sa.Column(sa.ForeignKey("computer.pk"))}
-    )
-    """The primary key of the computer that this calculation is associated with."""
+    """The primary key of the code that this calculation is associated with."""
 
     _outputs: List[DataNode] = field(
         default_factory=list,
@@ -146,7 +197,7 @@ class Calculation:
     @property
     def remote_path(self) -> PurePosixPath | PureWindowsPath:
         """Return the remote path for the calculation execution."""
-        return self.computer.work_path / "workflows" / self.uuid
+        return self.code.computer.work_path / "workflows" / self.uuid
 
 
 @mapper_registry.mapped
