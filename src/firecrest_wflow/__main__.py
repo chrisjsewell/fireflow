@@ -32,17 +32,17 @@ def main() -> None:
         script="mkdir -p output\necho 'Hello world!' > output.txt",
     )
 
-    calcs = [Calculation(code=code)] * 2
+    calcs = [Calculation(code=code) for _ in range(2)]
     storage = SqliteStorage(engine_kwargs={"echo": False})
     storage.save_many(calcs)
     run_unfinished_calculations(storage)
 
-    calc: Calculation
-    for calc in storage._session.query(Calculation):  # type: ignore
-        print(calc)  # noqa: T201
-        print("outputs:")  # noqa: T201
+    print("calculations:")  # noqa: T201
+    for calc in storage.all(Calculation):
+        print(" ", calc)  # noqa: T201
+        print("  ", "outputs:")  # noqa: T201
         for node in calc.outputs:
-            print(node, node.attributes)  # noqa: T201
+            print("  ", node, node.attributes)  # noqa: T201
 
 
 if __name__ == "__main__":

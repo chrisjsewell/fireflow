@@ -3,14 +3,12 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Any, Iterable, Protocol, Sequence, TypeVar, Union
+from typing import Any, Iterable, Protocol, Sequence, TypeVar
 
 import sqlalchemy as sa
 import sqlalchemy.orm as orm
 
-from firecrest_wflow.data import mapper_registry
-
-from .data import Calculation, Code, Computer
+from .data import Base, Calculation
 
 LOGGER = logging.getLogger(__name__)
 
@@ -18,19 +16,26 @@ LOGGER = logging.getLogger(__name__)
 class PersistProtocol(Protocol):
     """A persister for the calculation."""
 
-    def save(self, calc: Calculation) -> None:
+    def save(self, obj: Base) -> None:
+        """Save the calculation."""
+
+    def save_many(self, objs: Iterable[Base]) -> None:
         """Save the calculation."""
 
 
 class DummyStorage(PersistProtocol):
     """A dummy persister."""
 
-    def save(self, calc: Calculation) -> None:
+    def save(self, obj: Base) -> None:
         """Save the calculation."""
-        LOGGER.debug("Saving calculation %s", calc)
+        LOGGER.debug("Saving %s", obj)
+
+    def save_many(self, objs: Iterable[Base]) -> None:
+        """Save the calculation."""
+        LOGGER.debug("Saving %s", objs)
 
 
-OBJ_TYPE = TypeVar("OBJ_TYPE", bound=Union[Computer, Code, Calculation])
+OBJ_TYPE = TypeVar("OBJ_TYPE", bound=Base)
 
 
 class SqliteStorage(PersistProtocol):
@@ -42,16 +47,16 @@ class SqliteStorage(PersistProtocol):
         """Initialize the storage."""
         url = "sqlite:///:memory:" if path is None else f"sqlite:///{path}"
         self._engine = sa.create_engine(url, **(engine_kwargs or {}))
-        mapper_registry.metadata.create_all(self._engine)
+        Base.metadata.create_all(self._engine)
         self._session = orm.sessionmaker(bind=self._engine)()
 
-    def save(self, obj: Computer | Code | Calculation) -> None:
+    def save(self, obj: Base) -> None:
         """Save the calculation."""
-        LOGGER.info("Saving object %s", obj)
+        LOGGER.debug("Saving object %s", obj)
         self._session.add(obj)
         self._session.commit()
 
-    def save_many(self, objs: Iterable[Computer | Code | Calculation]) -> None:
+    def save_many(self, objs: Iterable[Base]) -> None:
         """Save the calculation."""
         LOGGER.debug("Saving objects %s", objs)
         self._session.add_all(objs)
@@ -62,11 +67,13 @@ class SqliteStorage(PersistProtocol):
         for obj in self._session.scalars(sa.select(obj_cls)):
             yield obj
 
-    def get_unfinished(self, max: None | int = None) -> Sequence[Calculation]:
-        """Get unfinished calculations."""
-        stmt = sa.select(Calculation).where(
-            Calculation.status != "finalised"  # type: ignore[arg-type]
+    def get_unfinished(self, limit: None | int = None) -> Sequence[Calculation]:
+        """Get unfinished calculations, that have not previously excepted."""
+        stmt = (
+            sa.select(Calculation)
+            .where(Calculation.step != "finalised")
+            .where(Calculation.exception == None)  # noqa: E711
         )
-        if max is not None:
-            stmt = stmt.limit(max)
+        if limit is not None:
+            stmt = stmt.limit(limit)
         return self._session.scalars(stmt).all()

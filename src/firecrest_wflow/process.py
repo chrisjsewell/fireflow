@@ -1,9 +1,12 @@
-"""A mock up how a calculation would be run in AiiDA with FirecREST."""
+"""Run calculations via FirecREST."""
 from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from pathlib import Path
+
+# import posixpath
 from tempfile import TemporaryDirectory
 import time
 from typing import Any, Sequence, TypedDict
@@ -23,9 +26,11 @@ LOGGER = logging.getLogger(__name__)
 JOB_NAME = "job.sh"
 
 
-def run_unfinished_calculations(storage: SqliteStorage) -> None:
+def run_unfinished_calculations(
+    storage: SqliteStorage, limit: None | int = None
+) -> None:
     """Run all unfinished calculations."""
-    calcs = storage.get_unfinished()
+    calcs = storage.get_unfinished(limit)
     asyncio.run(run_multiple_calculations(calcs, storage))
 
 
@@ -43,15 +48,15 @@ async def reliquish() -> None:
 
 async def run_calculation(calc: Calculation, persist: PersistProtocol) -> None:
     """Run a single calculation."""
-    while calc.status != "finalised":
+    while calc.step != "finalised":
         try:
             await run_step(calc)
         except Exception as exc:
             LOGGER.exception("Error running calculation %s", calc.uuid)
             exc_str = f"{type(exc).__name__}: {exc}"
             calc.exception = exc_str
-            calc.status = "finalised"
-        persist.save(calc)
+            break
+        persist.save_many([calc])
         await reliquish()
 
 
@@ -61,24 +66,26 @@ async def run_step(calc: Calculation) -> None:
     # TODO would like to move this to pattern matching, but ruff does not support it:
     # https://github.com/charliermarsh/ruff/issues/282
 
-    if calc.status == "created":
+    if calc.step == "created":
+        calc.step = "uploading"
+    if calc.step == "uploading":
         with TemporaryDirectory() as in_tmpdir:
             await prepare_for_submission(calc, Path(in_tmpdir))
             await copy_to_remote(calc, Path(in_tmpdir))
-        calc.status = "uploaded"
-    elif calc.status == "uploaded":
+        calc.step = "submitting"
+    elif calc.step == "submitting":
         await submit_on_remote(calc)
-        calc.status = "submitted"
-    elif calc.status == "submitted":
+        calc.step = "running"
+    elif calc.step == "running":
         await poll_until_finished(calc)
-        calc.status = "executed"
-    elif calc.status == "executed":
+        calc.step = "retrieving"
+    elif calc.step == "retrieving":
         with TemporaryDirectory() as out_tmpdir:
             await copy_from_remote(calc, Path(out_tmpdir))
             await parse_output_files(calc, Path(out_tmpdir))
-        calc.status = "finalised"
+        calc.step = "finalised"
     else:
-        raise ValueError(f"Unknown status {calc.status}")
+        raise ValueError(f"Unknown step name {calc.step}")
 
 
 async def prepare_for_submission(calc: Calculation, local_path: Path) -> None:
@@ -96,6 +103,8 @@ async def prepare_for_submission(calc: Calculation, local_path: Path) -> None:
     )
     job_script = jinja2.Template(script_template).render(calc=calc)
     local_path.joinpath(JOB_NAME).write_text(job_script, encoding="utf-8")
+    # for path, content in calc.text_files.items():
+    #     local_path.joinpath(*posixpath.split(path)).write_text(content, encoding="utf-8")
 
 
 async def poll_object_transfer(
@@ -133,13 +142,14 @@ async def copy_to_remote(calc: Calculation, local_folder: Path) -> None:
                 up_obj = client.external_upload(
                     computer.machine_name, str(local_path), str(target_path.parent)
                 )
-                # TODO here we do not use pyfirecrest's finish_upload,
+                # Note, here we do not use pyfirecrest's finish_upload,
                 # since it simply runs a subprocess to do the upload (calling curl)
                 # instead we properly async the upload
                 # up_obj.finish_upload()
                 params = up_obj.object_storage_data["parameters"]
-                # TODO this local fix for MACs was necessary for the demo
-                params["url"] = params["url"].replace("192.168.220.19", "localhost")
+                if os.environ.get("FIRECREST_DEMO"):
+                    # TODO this local fix for MACs was necessary for the demo
+                    params["url"] = params["url"].replace("192.168.220.19", "localhost")
                 await upload_file_to_url(local_path, params)
                 await poll_object_transfer(up_obj)
                 # TODO invalidate the upload object
@@ -199,23 +209,26 @@ async def copy_from_remote(calc: Calculation, local_folder: Path) -> None:
                 )
                 await poll_object_transfer(down_obj)
 
-                # TODO here instead of using down_obj.finish_download
+                # here instead of using down_obj.finish_download
                 # we use an asynchoronous version of it
                 url = down_obj.object_storage_data
-                # await download_url_to_file(url, local_path)
 
-                # TODO however the url above doesn't work locally, with the demo docker
-                # there was a fix already noted for MAC: url.replace("192.168.220.19", "localhost")
-                # however, this still gives a 403 error:
-                # "The request signature we calculated does not match the signature you provided.
-                # Check your key and signing method.""
-                # so for now, I'm just going to swap out the URL, with the actual location on disk
-                # where the files are stored for the demo!
-                store_path = (
-                    "/Users/chrisjsewell/Documents/GitHub/firecrest/deploy/demo/minio"
-                    + urlparse(url).path
-                )
-                await copy_file_async(store_path, local_path)
+                if os.environ.get("FIRECREST_DEMO"):
+                    # TODO however the url above doesn't work locally, with the demo docker
+                    # there was a fix already noted for MAC:url.replace("192.168.220.19", "localhost")
+                    # however, this still gives a 403 error:
+                    # "The request signature we calculated does not match the signature you provided.
+                    # Check your key and signing method.""
+                    # so for now, I'm just going to swap out the URL, with the actual location on disk
+                    # where the files are stored for the demo!
+                    store_path = (
+                        "/Users/chrisjsewell/Documents/GitHub/firecrest/deploy/demo/minio"
+                        + urlparse(url).path
+                    )
+                    await copy_file_async(store_path, local_path)
+                else:
+                    await download_url_to_file(url, local_path)
+
                 # TODO invalidate the download object
 
 
@@ -227,7 +240,7 @@ async def parse_output_files(calc: Calculation, local_path: Path) -> None:
         paths.append(
             path.relative_to(local_path).as_posix() + ("/" if path.is_dir() else "")
         )
-    DataNode(creator=calc, attributes={"paths": paths})
+    calc.outputs.append(DataNode(attributes={"paths": paths}))
 
 
 # HELPER functions
