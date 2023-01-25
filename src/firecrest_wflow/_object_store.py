@@ -6,7 +6,18 @@ from contextlib import closing
 import hashlib
 from io import BytesIO
 from pathlib import Path
-from typing import BinaryIO
+import shutil
+import tempfile
+from typing import BinaryIO, Protocol
+
+COPY_BUFSIZE = 64 * 1024
+
+
+class BinaryStream(Protocol):
+    """A binary stream, that can be read once and only once, optionally in chunks."""
+
+    def read(self, size: int = -1) -> bytes:
+        """Read the stream."""
 
 
 class ObjectStore(ABC):
@@ -17,7 +28,7 @@ class ObjectStore(ABC):
 
     @abstractmethod
     def add_from_bytes(self, obj: bytes, ext: str = "") -> str:
-        """Add an object to the store idempotently.
+        """Add an object to the store idempotently and atomically.
 
         :param obj: the object to store
         :param ext: the file extension of the object, e.g. "json"
@@ -26,8 +37,10 @@ class ObjectStore(ABC):
         """
 
     @abstractmethod
-    def add_from_io(self, obj: BinaryIO, *, ext: str = "", chunks: int = 4096) -> str:
-        """Add an object to the store idempotently.
+    def add_from_io(
+        self, obj: BinaryStream, *, ext: str = "", chunks: int = COPY_BUFSIZE
+    ) -> str:
+        """Add an object to the store idempotently and atomically.
 
         :param obj: the object to store
         :param ext: the file extension of the object, e.g. "json"
@@ -36,8 +49,8 @@ class ObjectStore(ABC):
         :raises ValueError: if the object is already in the store with a different extension.
         """
 
-    def add_from_path(self, path: Path, *, chunks: int = 4096) -> str:
-        """Add an object to the store idempotently.
+    def add_from_path(self, path: Path, *, chunks: int = COPY_BUFSIZE) -> str:
+        """Add an object to the store idempotently and atomically.
 
         :param path: the path to the object
         :param chunks: the size of chunks to stream in
@@ -48,11 +61,11 @@ class ObjectStore(ABC):
             return self.add_from_io(obj, ext=path.suffix.lstrip("."), chunks=chunks)
 
     def add_from_glob(
-        self, path: Path, glob: str, *, chunks: int = 4096
+        self, path: Path, glob: str, *, chunks: int = COPY_BUFSIZE
     ) -> dict[str, str]:
-        """Add objects to the store idempotently.
+        """Add objects to the store idempotently and atomically.
 
-        :param path: the path to the objects
+        :param path: the path to the objects directory
         :param glob: a glob pattern to match files in the directory
         :param chunks: the size of chunks to stream in
         :return: a mapping from the path to the key of the object
@@ -87,7 +100,9 @@ class InMemoryObjectStore(ObjectStore):
         """Initialize the store."""
         self._store: dict[str, tuple[str, bytes]] = {}
 
-    def add_from_io(self, obj: BinaryIO, *, ext: str = "", chunks: int = 4096) -> str:
+    def add_from_io(
+        self, obj: BinaryStream, *, ext: str = "", chunks: int = COPY_BUFSIZE
+    ) -> str:
         return self.add_from_bytes(obj.read(), ext=ext)
 
     def add_from_bytes(self, obj: bytes, ext: str = "") -> str:
@@ -126,27 +141,28 @@ class FileObjectStore(ObjectStore):
         path.write_bytes(obj)
         return sha256
 
-    def add_from_io(self, obj: BinaryIO, *, ext: str = "", chunks: int = 4096) -> str:
+    def add_from_io(
+        self, obj: BinaryStream, *, ext: str = "", chunks: int = COPY_BUFSIZE
+    ) -> str:
         hasher = hashlib.sha256()
-        while True:
-            chunk = obj.read(chunks)
-            if not chunk:
-                break
-            hasher.update(chunk)
-        sha256 = hasher.hexdigest()
-        if sha256 in self and self.extension(sha256) != ext:
-            raise ValueError(
-                f"Object already in store with different extension: {sha256}"
-            )
-
-        obj.seek(0)
-        path = self._path / f"{sha256}.{ext}"
-        with path.open("wb") as handle:
+        with tempfile.TemporaryFile("wb") as temp:
             while True:
-                chunk = obj.read(4096)
+                chunk = obj.read(chunks)
                 if not chunk:
                     break
-                handle.write(chunk)
+                hasher.update(chunk)
+                temp.write(chunk)
+            sha256 = hasher.hexdigest()
+            if sha256 in self:
+                if self.extension(sha256) != ext:
+                    raise ValueError(
+                        f"Object already in store with different extension: {sha256}"
+                    )
+                return sha256
+            temp.seek(0)
+            with open(self._path / f"{sha256}.{ext}") as handle:
+                shutil.copyfileobj(temp, handle)  # type: ignore
+
         return sha256
 
     def _get_path(self, sha256: str) -> Path:
