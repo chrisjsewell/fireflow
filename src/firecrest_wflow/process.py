@@ -5,6 +5,8 @@ import asyncio
 import logging
 import os
 from pathlib import Path
+import posixpath
+import shutil
 
 # import posixpath
 from tempfile import TemporaryDirectory
@@ -17,28 +19,26 @@ import aiohttp
 import firecrest
 import jinja2
 
-from firecrest_wflow.data import Calculation, DataNode
+from firecrest_wflow._orm import Calculation, DataNode, Processing
 from firecrest_wflow.patches import ls_recurse
-from firecrest_wflow.storage import PersistProtocol, SqliteStorage
+from firecrest_wflow.storage import Storage
 
 LOGGER = logging.getLogger(__name__)
 
 JOB_NAME = "job.sh"
 
 
-def run_unfinished_calculations(
-    storage: SqliteStorage, limit: None | int = None
-) -> None:
+def run_unfinished_calculations(storage: Storage, limit: None | int = None) -> None:
     """Run all unfinished calculations."""
-    calcs = storage.get_unfinished(limit)
-    asyncio.run(run_multiple_calculations(calcs, storage))
+    running = storage.get_unfinished(limit)
+    asyncio.run(run_multiple_calculations(running, storage))
 
 
 async def run_multiple_calculations(
-    calcs: Sequence[Calculation], persist: PersistProtocol
+    calcs: Sequence[Processing], storage: Storage
 ) -> None:
     """Run multiple calculations."""
-    await asyncio.gather(*[run_calculation(calc, persist) for calc in calcs])
+    await asyncio.gather(*[run_calculation(calc, storage) for calc in calcs])
 
 
 async def reliquish() -> None:
@@ -46,65 +46,66 @@ async def reliquish() -> None:
     await asyncio.sleep(0)
 
 
-async def run_calculation(calc: Calculation, persist: PersistProtocol) -> None:
+async def run_calculation(process: Processing, storage: Storage) -> None:
     """Run a single calculation."""
-    while calc.step != "finalised":
+    while process.step != "finalised":
         try:
-            await run_step(calc)
+            await run_step(process, storage)
         except Exception as exc:
-            LOGGER.exception("Error running calculation %s", calc.uuid)
+            LOGGER.exception("Error running calculation %s", process.calculation.uuid)
             exc_str = f"{type(exc).__name__}: {exc}"
-            calc.exception = exc_str
+            process.exception = exc_str
             break
-        persist.save_many([calc])
+        storage.update_processing(process)
         await reliquish()
 
 
-async def run_step(calc: Calculation) -> None:
+async def run_step(status: Processing, storage: Storage) -> None:
     """Run a single step of a computation."""
 
     # TODO would like to move this to pattern matching, but ruff does not support it:
     # https://github.com/charliermarsh/ruff/issues/282
 
-    if calc.step == "created":
-        calc.step = "uploading"
-    if calc.step == "uploading":
+    calc = status.calculation
+
+    if status.step == "created":
+        status.step = "uploading"
+    if status.step == "uploading":
         with TemporaryDirectory() as in_tmpdir:
-            await prepare_for_submission(calc, Path(in_tmpdir))
+            await prepare_for_submission(calc, Path(in_tmpdir), storage)
             await copy_to_remote(calc, Path(in_tmpdir))
-        calc.step = "submitting"
-    elif calc.step == "submitting":
+        status.step = "submitting"
+    elif status.step == "submitting":
         await submit_on_remote(calc)
-        calc.step = "running"
-    elif calc.step == "running":
+        status.step = "running"
+    elif status.step == "running":
         await poll_until_finished(calc)
-        calc.step = "retrieving"
-    elif calc.step == "retrieving":
+        status.step = "retrieving"
+    elif status.step == "retrieving":
         with TemporaryDirectory() as out_tmpdir:
             await copy_from_remote(calc, Path(out_tmpdir))
             await parse_output_files(calc, Path(out_tmpdir))
-        calc.step = "finalised"
+        status.step = "finalised"
     else:
-        raise ValueError(f"Unknown step name {calc.step}")
+        raise ValueError(f"Unknown step name {status.step}")
 
 
-async def prepare_for_submission(calc: Calculation, local_path: Path) -> None:
+async def prepare_for_submission(
+    calc: Calculation, local_path: Path, storage: Storage
+) -> None:
     """Prepares the (local) calculation folder with all inputs,
     ready to be copied to the compute resource.
     """
     LOGGER.info("prepare for submission: %s", calc.uuid)
-
-    script_template = "\n".join(
-        [
-            "#!/bin/bash",
-            "#SBATCH --job-name={{calc.uuid}}",
-        ]
-        + calc.code.script.splitlines()
-    )
-    job_script = jinja2.Template(script_template).render(calc=calc)
+    job_script = jinja2.Template(calc.code.script).render(calc=calc)
     local_path.joinpath(JOB_NAME).write_text(job_script, encoding="utf-8")
-    # for path, content in calc.text_files.items():
-    #     local_path.joinpath(*posixpath.split(path)).write_text(content, encoding="utf-8")
+    for rel_path, key in calc.upload.items():
+        path = local_path.joinpath(*posixpath.split(rel_path))
+        if key is None:
+            path.mkdir(parents=True, exist_ok=True)
+        else:
+            with open(path, "wb") as handle, storage._object_store.open(key) as obj:
+                shutil.copyfileobj(obj, handle)
 
 
 async def poll_object_transfer(
@@ -152,7 +153,6 @@ async def copy_to_remote(calc: Calculation, local_folder: Path) -> None:
                     params["url"] = params["url"].replace("192.168.220.19", "localhost")
                 await upload_file_to_url(local_path, params)
                 await poll_object_transfer(up_obj)
-                # TODO invalidate the upload object
 
 
 async def submit_on_remote(calc: Calculation) -> None:
@@ -162,7 +162,7 @@ async def submit_on_remote(calc: Calculation) -> None:
     LOGGER.info("submitting on remote: %s", script_path)
     client = computer.client
     result = client.submit(computer.machine_name, str(script_path), local_file=False)
-    calc.attributes["job_id"] = result["jobid"]
+    calc.status.job_id = result["jobid"]
 
 
 async def poll_until_finished(
@@ -174,7 +174,7 @@ async def poll_until_finished(
     client = computer.client
     start = time.time()
     while timeout is None or (time.time() - start) < timeout:
-        results = client.poll(computer.machine_name, [calc.attributes["job_id"]])
+        results = client.poll(computer.machine_name, [calc.status.job_id])
         if results and results[0]["state"] == "COMPLETED":
             break
         await asyncio.sleep(interval)
@@ -229,7 +229,8 @@ async def copy_from_remote(calc: Calculation, local_folder: Path) -> None:
                 else:
                     await download_url_to_file(url, local_path)
 
-                # TODO invalidate the download object
+                # now invalidate the download object, since we no longer need it
+                down_obj.invalidate_object_storage_link()
 
 
 async def parse_output_files(calc: Calculation, local_path: Path) -> None:

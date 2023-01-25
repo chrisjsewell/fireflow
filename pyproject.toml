@@ -23,11 +23,12 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-cli = ["click", "pyyaml"]
+cli = ["click", "click-config-file", "pyyaml"]
 testing = ["pytest"]
 
 [project.scripts]
-fc-wflow-mock = "firecrest_wflow.__main__:main"
+fc-wflow-mock = "firecrest_wflow._test:main"
+fc-wkflow = "firecrest_wflow.cli:main"
 
 [project.urls]
 Home = "https://github.com/chrisjsewell/firecrest-workflows"

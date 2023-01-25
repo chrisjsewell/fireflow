@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from dataclasses import fields
 import json
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -10,42 +11,64 @@ import click
 import click_config_file
 import yaml
 
-from firecrest_wflow.data import Computer
-from firecrest_wflow.storage import SqliteStorage
-
-try:
-    import tomllib
-
-    NO_TOMLLIB = False
-except ImportError:
-    NO_TOMLLIB = True
+from firecrest_wflow._orm import Computer
+from firecrest_wflow.process import run_unfinished_calculations
+from firecrest_wflow.storage import Storage
 
 
 class StorageContext:
     """The storage context."""
 
-    def __init__(self, path: str | None = None):
+    def __init__(self, storage_dir: str | Path) -> None:
         """Initialize the context."""
-        self._path = path
-        self._storage: None | SqliteStorage = None
+        self._storage_dir = Path(storage_dir)
+        self._storage: None | Storage = None
 
     @property
-    def storage(self) -> SqliteStorage:
+    def storage(self) -> Storage:
         """Get the storage."""
         if self._storage is None:
-            self._storage = SqliteStorage(self._path)
+            self._storage = Storage.on_file(self._storage_dir, init=True)
         return self._storage
 
 
 pass_storage = click.make_pass_decorator(StorageContext, ensure=True)
 
 
-@click.group()
-@click.option("--path", type=click.Path(dir_okay=False), default="wkflow.sqlite")
+@click.group(context_settings={"help_option_names": ["-h", "--help"]})
+@click.option(
+    "-s",
+    "--storage-dir",
+    type=click.Path(file_okay=False, dir_okay=True),
+    default="wkflow_storage",
+)
 @click.pass_context
-def main(ctx: click.Context, path: str | None) -> None:
+def main(ctx: click.Context, storage_dir: str) -> None:
     """The firecrest-wflow CLI."""
-    ctx.obj = StorageContext(path)
+    ctx.obj = StorageContext(storage_dir)
+
+
+@main.command()
+@click.argument("path", type=click.Path(exists=True, dir_okay=False))
+@pass_storage
+def create(storage: StorageContext, path: str) -> None:
+    """Create the storage."""
+    storage.storage.from_yaml(path)
+
+
+@main.command()
+@click.option(
+    "--log-level", type=click.Choice(("DEBUG", "INFO", "WARNING")), default="INFO"
+)
+@pass_storage
+def run(storage: StorageContext, log_level: str) -> None:
+    """Run the calculations."""
+    logging.basicConfig(
+        format="%(asctime)s:%(name)s:%(levelname)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+        level=getattr(logging, log_level),
+    )
+    run_unfinished_calculations(storage.storage)
 
 
 @main.group()
@@ -60,18 +83,12 @@ def config_provider(path_str: str, _: Any) -> Any:
         raise click.BadParameter(f"Config file {path} does not exist")
     if path.suffix == ".json":
         return json.loads(path.read_text("utf-8"))
-    if path.suffix == ".toml":
-        if NO_TOMLLIB:
-            raise click.BadParameter(
-                f"Config file {path} has .toml suffix but tomli is not installed"
-            )
-        return tomllib.loads(path.read_text("utf-8"))
     if path.suffix in (".yaml", ".yml"):
         return yaml.safe_load(path.read_text("utf-8"))
     raise click.BadParameter(f"Config file {path} has unknown suffix")
 
 
-@computer.command()
+@computer.command("create")
 @click.option("--client-url", required=True)
 @click.option("--client-id", required=True)
 @click.option("--client-secret", required=True)
@@ -79,12 +96,13 @@ def config_provider(path_str: str, _: Any) -> Any:
 @click.option("--machine-name", required=True)
 @click.option("--work-dir", required=True)
 @click.option("--small-file-size-mb", required=True, type=int)
+@click.option("--label")
 @click_config_file.configuration_option(implicit=False, provider=config_provider)  # type: ignore
 @pass_storage
-def create(storage: StorageContext, **kwargs: Any) -> None:
+def create_computer(storage: StorageContext, **kwargs: Any) -> None:
     """Create a computer."""
     computer = Computer(**kwargs)
-    storage.storage.save(computer)
+    storage.storage.save_computer(computer)
 
 
 @computer.command()
@@ -96,6 +114,7 @@ def list(storage: StorageContext) -> None:
         data.append(
             {
                 "pk": comp.pk,
+                "label": comp.label,
                 "client_url": comp.client_url,
                 "client_id": comp.client_id,
                 "machine_name": comp.machine_name,
@@ -116,7 +135,3 @@ def show(storage: StorageContext, pk: int) -> None:
             continue
         data[field.name] = getattr(computer, field.name)
     click.echo(yaml.safe_dump(data, default_flow_style=False, sort_keys=False))
-
-
-if __name__ == "__main__":
-    main(help_option_names=["-h", "--help"])
