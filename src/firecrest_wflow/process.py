@@ -184,6 +184,12 @@ async def poll_until_finished(
 
 async def copy_from_remote(calc: Calculation, local_folder: Path) -> None:
     """Copy the calculation outputs from the compute resource."""
+    # TODO this should take the calc.download_globs, and only copy those
+    # directly into the object storage
+    # before downloading, we can also get the checksum to see if it is already in the store
+    # once its in the store, then we want to update the calc process,
+    # to record the (POSIX) path we retrieved
+
     computer = calc.code.computer
     remote_folder = calc.remote_path
     LOGGER.info("copying from remote folder: %s", remote_folder)

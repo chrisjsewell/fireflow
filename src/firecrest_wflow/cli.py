@@ -11,7 +11,7 @@ import click
 import click_config_file
 import yaml
 
-from firecrest_wflow._orm import Computer
+from firecrest_wflow._orm import Calculation, Computer
 from firecrest_wflow.process import run_unfinished_calculations
 from firecrest_wflow.storage import Storage
 
@@ -57,18 +57,19 @@ def create(storage: StorageContext, path: str) -> None:
 
 
 @main.command()
+@click.argument("number", type=int, default=10)
 @click.option(
     "--log-level", type=click.Choice(("DEBUG", "INFO", "WARNING")), default="INFO"
 )
 @pass_storage
-def run(storage: StorageContext, log_level: str) -> None:
-    """Run the calculations."""
+def run(storage: StorageContext, number: int, log_level: str) -> None:
+    """Run a maximum number of unfinished calculations."""
     logging.basicConfig(
         format="%(asctime)s:%(name)s:%(levelname)s: %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
         level=getattr(logging, log_level),
     )
-    run_unfinished_calculations(storage.storage)
+    run_unfinished_calculations(storage.storage, number)
 
 
 @main.group()
@@ -134,4 +135,27 @@ def show(storage: StorageContext, pk: int) -> None:
         if field.name.startswith("_"):
             continue
         data[field.name] = getattr(computer, field.name)
+    click.echo(yaml.safe_dump(data, default_flow_style=False, sort_keys=False))
+
+
+@main.group()
+def calculation() -> None:
+    """Calculation related commands."""
+
+
+@calculation.command("list")
+@pass_storage
+def list_calc(storage: StorageContext) -> None:
+    """List calculations."""
+    data = []
+    for calc in storage.storage.all(Calculation):
+        data.append(
+            {
+                "pk": calc.pk,
+                "label": calc.label,
+                "code": calc.code.label,
+                "computer": calc.code.computer.label,
+                "status": calc.status.step,
+            }
+        )
     click.echo(yaml.safe_dump(data, default_flow_style=False, sort_keys=False))

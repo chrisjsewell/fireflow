@@ -29,8 +29,9 @@ class Storage:
         return cls(engine, InMemoryObjectStore())
 
     @classmethod
-    def on_file(cls, path: Path, *, init: bool = False) -> Storage:
+    def on_file(cls, path: Path | str, *, init: bool = False) -> Storage:
         """Connect to an on-file storage."""
+        path = Path(path)
         engine = sa.create_engine(f"sqlite:///{path / 'storage.sqlite'}")
         object_path = path / "objects"
         if init:
@@ -139,6 +140,4 @@ class Storage:
                 calculations = code_data.pop("calculations")
                 code = self.save_code(Code(**code_data, computer=computer))
                 for calculation_data in calculations:
-                    self.save_calculation(
-                        Calculation(**calculation_data, code=code, status=Processing())
-                    )
+                    self.save_calculation(Calculation(**calculation_data, code=code))
