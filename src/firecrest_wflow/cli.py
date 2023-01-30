@@ -1,28 +1,98 @@
-"""A click based CLI for firecrest-wflow."""
-from __future__ import annotations
-
-from dataclasses import fields
-import json
+"""A CLI for firecrest-wflow."""
+from enum import Enum
 import logging
 from pathlib import Path
-from typing import Any
+import typing as t
 
-import click
-import click_config_file
+from rich import box
+from rich.console import Console
+from rich.table import Table
+from rich.tree import Tree
+import typer
 import yaml
 
-from firecrest_wflow._orm import Calculation, Computer
-from firecrest_wflow.process import run_unfinished_calculations
+from firecrest_wflow import __version__
+from firecrest_wflow import _orm as orm
+from firecrest_wflow.process import run_unfinished_calcjobs
 from firecrest_wflow.storage import Storage
+
+console = Console()
+app_main = typer.Typer(
+    context_settings={"help_option_names": ["-h", "--help"]}, rich_markup_mode="rich"
+)
+app_client = typer.Typer(rich_markup_mode="rich")
+app_main.add_typer(
+    app_client,
+    name="client",
+    rich_help_panel="Command Groups",
+    help="Configure and inspect connections to FirecREST clients.",
+)
+app_code = typer.Typer(rich_markup_mode="rich")
+app_main.add_typer(
+    app_code,
+    name="code",
+    rich_help_panel="Command Groups",
+    help="Configure and inspect codes running on a client.",
+)
+app_calcjob = typer.Typer(rich_markup_mode="rich")
+app_main.add_typer(
+    app_calcjob,
+    name="calcjob",
+    rich_help_panel="Command Groups",
+    help="Configure and inspect calculation jobs to run a code.",
+)
+
+# TODO how to order typers in help panel?
+
+
+def version_callback(value: bool) -> None:
+    """Print the version and exit."""
+    if value:
+        console.print(f"firecrest_wflow version: {__version__}")
+        raise typer.Exit()
+
+
+def create_table(
+    table_title: str, data: t.Iterable[t.Dict[str, t.Any]], *mappings: t.Tuple[str, str]
+) -> Table:
+    """Create a table to print"""
+    table = Table(title=table_title, box=box.ROUNDED)
+    for (title, _) in mappings:
+        table.add_column(title, overflow="fold")
+
+    for i in data:
+        table.add_row(*(str(i[key]) for (_, key) in mappings))
+
+    return table
+
+
+def config_callback(
+    ctx: typer.Context, param: typer.CallbackParam, value: t.Optional[Path]
+) -> t.Optional[Path]:
+    if value is not None:
+        typer.echo(f"Loading config file: {value}")
+        try:
+            with open(value, "r") as f:  # Load config file
+                conf = yaml.safe_load(f)
+            ctx.default_map = ctx.default_map or {}  # Initialize the default map
+            ctx.default_map.update(conf)  # Merge the config dict into default_map
+        except Exception as ex:
+            raise typer.BadParameter(str(ex))
+    return value
 
 
 class StorageContext:
     """The storage context."""
 
-    def __init__(self, storage_dir: str | Path) -> None:
+    def __init__(self, storage_dir: t.Union[None, str, Path] = None) -> None:
         """Initialize the context."""
+        if storage_dir is None:
+            raise ValueError("storage_dir must be specified")
         self._storage_dir = Path(storage_dir)
-        self._storage: None | Storage = None
+        self._storage: t.Optional[Storage] = None
+
+    def __str__(self) -> str:
+        return f"StorageContext({str(self._storage_dir)!r})"
 
     @property
     def storage(self) -> Storage:
@@ -32,130 +102,235 @@ class StorageContext:
         return self._storage
 
 
-pass_storage = click.make_pass_decorator(StorageContext, ensure=True)
+@app_main.callback()
+def main_app(
+    ctx: typer.Context,
+    storage: Path = typer.Option(
+        "wkflow_storage",
+        "-s",
+        "--storage-dir",
+        file_okay=False,
+        dir_okay=True,
+        resolve_path=True,
+        help="Path to the storage directory.",
+    ),
+    version: t.Optional[bool] = typer.Option(
+        None,
+        "--version",
+        callback=version_callback,
+        is_eager=True,
+        help="Show the application version and exit.",
+    ),
+) -> None:
+    """[underline]Firecrest workflow manager[/underline]"""
+    ctx.obj = StorageContext(storage)
 
 
-@click.group(context_settings={"help_option_names": ["-h", "--help"]})
-@click.option(
-    "-s",
-    "--storage-dir",
-    type=click.Path(file_okay=False, dir_okay=True),
-    default="wkflow_storage",
-)
-@click.pass_context
-def main(ctx: click.Context, storage_dir: str) -> None:
-    """The firecrest-wflow CLI."""
-    ctx.obj = StorageContext(storage_dir)
+@app_main.command("init")
+def main_init(
+    ctx: typer.Context,
+    config: t.Optional[Path] = typer.Argument(
+        None,
+        file_okay=True,
+        dir_okay=False,
+        resolve_path=True,
+        help="Path to a YAML configuration file.",
+    ),
+) -> None:
+    """Initialize the storage."""
+    storage = ctx.ensure_object(StorageContext).storage
+    if config is not None:
+        storage.from_yaml(config)
 
 
-@main.command()
-@click.argument("path", type=click.Path(exists=True, dir_okay=False))
-@pass_storage
-def create(storage: StorageContext, path: str) -> None:
-    """Create the storage."""
-    storage.storage.from_yaml(path)
+class LogLevel(str, Enum):
+    debug = "DEBUG"
+    info = "INFO"
+    warning = "WARNING"
+    error = "ERROR"
+    critical = "CRITICAL"
 
 
-@main.command()
-@click.argument("number", type=int, default=10)
-@click.option(
-    "--log-level", type=click.Choice(("DEBUG", "INFO", "WARNING")), default="INFO"
-)
-@pass_storage
-def run(storage: StorageContext, number: int, log_level: str) -> None:
-    """Run a maximum number of unfinished calculations."""
+@app_main.command("run")
+def main_run(
+    ctx: typer.Context,
+    number: int = typer.Option(10, help="Maximum number of jobs to run"),
+    log_level: LogLevel = typer.Option(
+        LogLevel.info, case_sensitive=False, help="Logging level"
+    ),
+) -> None:
+    """Run unfinished calcjobs."""
+    storage = ctx.ensure_object(StorageContext).storage
     logging.basicConfig(
         format="%(asctime)s:%(name)s:%(levelname)s: %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
-        level=getattr(logging, log_level),
+        level=getattr(
+            logging, log_level.value
+        ),  # TODO logging.getLevelNamesMapping (>=3.11)
     )
-    run_unfinished_calculations(storage.storage, number)
+    run_unfinished_calcjobs(storage, number)
 
 
-@main.group()
-def computer() -> None:
-    """Computer related commands."""
+@app_client.command("create")
+def client_create(
+    ctx: typer.Context,
+    config: t.Optional[Path] = typer.Option(
+        None,
+        "-c",
+        "--config",
+        callback=config_callback,
+        is_eager=True,
+        show_default=False,
+        help="Path to a YAML file, to set defaults.",
+    ),
+    client_url: str = typer.Option(..., show_default=False, help="URL of the client"),
+    client_id: str = typer.Option(..., show_default=False, help="Client ID"),
+    client_secret: str = typer.Option(..., show_default=False, help="Client secret"),
+    token_uri: str = typer.Option(..., show_default=False, help="Token URI"),
+    machine_name: str = typer.Option(..., show_default=False, help="Machine name"),
+    work_dir: str = typer.Option(
+        ..., show_default=False, help="Work directory (absolute)"
+    ),
+    small_file_size_mb: int = typer.Option(
+        ..., show_default=False, help="Small file size in MB"
+    ),
+    label: t.Optional[str] = typer.Option(
+        None, show_default=False, help="Label for the client"
+    ),
+) -> None:
+    """Create a new client."""
+    storage = ctx.ensure_object(StorageContext).storage
+    client = orm.Client(
+        client_url=client_url,
+        client_id=client_id,
+        client_secret=client_secret,
+        token_uri=token_uri,
+        machine_name=machine_name,
+        work_dir=work_dir,
+        small_file_size_mb=small_file_size_mb,
+        label=label,
+    )
+    storage.save_client(client)
 
 
-def config_provider(path_str: str, _: Any) -> Any:
-    """Provide the config."""
-    path = Path(path_str)
-    if not path.exists():
-        raise click.BadParameter(f"Config file {path} does not exist")
-    if path.suffix == ".json":
-        return json.loads(path.read_text("utf-8"))
-    if path.suffix in (".yaml", ".yml"):
-        return yaml.safe_load(path.read_text("utf-8"))
-    raise click.BadParameter(f"Config file {path} has unknown suffix")
-
-
-@computer.command("create")
-@click.option("--client-url", required=True)
-@click.option("--client-id", required=True)
-@click.option("--client-secret", required=True)
-@click.option("--token-uri", required=True)
-@click.option("--machine-name", required=True)
-@click.option("--work-dir", required=True)
-@click.option("--small-file-size-mb", required=True, type=int)
-@click.option("--label")
-@click_config_file.configuration_option(implicit=False, provider=config_provider)  # type: ignore
-@pass_storage
-def create_computer(storage: StorageContext, **kwargs: Any) -> None:
-    """Create a computer."""
-    computer = Computer(**kwargs)
-    storage.storage.save_computer(computer)
-
-
-@computer.command()
-@pass_storage
-def list(storage: StorageContext) -> None:
-    """List computers."""
-    data = []
-    for comp in storage.storage.all(Computer):
-        data.append(
+@app_client.command("list")
+def client_list(
+    ctx: typer.Context,
+    page: int = typer.Option(1, help="The page of results to show"),
+    page_size: int = typer.Option(100, help="The number of results per page"),
+) -> None:
+    """List Clients."""
+    storage = ctx.ensure_object(StorageContext).storage
+    count = storage.count_obj(orm.Client)
+    table = create_table(
+        "Clients {}-{} of {}".format(
+            (page - 1) * page_size + 1, min(page * page_size, count), count
+        ),
+        (
             {
-                "pk": comp.pk,
-                "label": comp.label,
-                "client_url": comp.client_url,
-                "client_id": comp.client_id,
-                "machine_name": comp.machine_name,
+                "pk": client.pk,
+                "label": client.label,
+                "client_url": client.client_url,
+                "client_id": client.client_id,
+                "machine_name": client.machine_name,
             }
-        )
-    click.echo(yaml.safe_dump(data, default_flow_style=False, sort_keys=False))
+            for client in storage.iter_obj(orm.Client, page=page, page_size=page_size)
+        ),
+        ("PK", "pk"),
+        ("Label", "label"),
+        ("Client URL", "client_url"),
+        ("Client ID", "client_id"),
+        ("Machine", "machine_name"),
+    )
+    console.print(table)
 
 
-@computer.command()
-@click.argument("pk", type=int)
-@pass_storage
-def show(storage: StorageContext, pk: int) -> None:
-    """Show a computer."""
-    computer = storage.storage._session.get(Computer, pk)
-    data = {}
-    for field in fields(computer):
-        if field.name.startswith("_"):
-            continue
-        data[field.name] = getattr(computer, field.name)
-    click.echo(yaml.safe_dump(data, default_flow_style=False, sort_keys=False))
+@app_code.command("tree")
+def code_tree(
+    ctx: typer.Context,
+    page: int = typer.Option(1, help="The page of results to show"),
+    page_size: int = typer.Option(100, help="The number of results per page"),
+) -> None:
+    """Tree of Client :left_arrow_curving_right: Code."""
+    storage = ctx.ensure_object(StorageContext).storage
+    count = storage.count_obj(orm.Code)
+    tree = Tree(
+        "[bold]Codes[/bold] {}-{} of {}".format(
+            (page - 1) * page_size + 1, min(page * page_size, count), count
+        ),
+        highlight=False,
+    )
+    client_nodes: t.Dict[int, Tree] = {}
+    for code in storage.iter_obj(orm.Code, page=page, page_size=page_size):
+        if code.client.pk not in client_nodes:
+            client_nodes[code.client.pk] = tree.add(
+                f"[blue]{code.client.pk}[/blue] - {code.client.label}"
+            )
+        client_nodes[code.client.pk].add(f"[blue]{code.pk}[/blue] - {code.label}")
+    console.print(tree)
 
 
-@main.group()
-def calculation() -> None:
-    """Calculation related commands."""
-
-
-@calculation.command("list")
-@pass_storage
-def list_calc(storage: StorageContext) -> None:
-    """List calculations."""
-    data = []
-    for calc in storage.storage.all(Calculation):
-        data.append(
+@app_code.command("list")
+def code_list(
+    ctx: typer.Context,
+    page: int = typer.Option(1, help="The page of results to show"),
+    page_size: int = typer.Option(100, help="The number of results per page"),
+) -> None:
+    """List Codes."""
+    storage = ctx.ensure_object(StorageContext).storage
+    count = storage.count_obj(orm.Code)
+    table = create_table(
+        "Codes {}-{} of {}".format(
+            (page - 1) * page_size + 1, min(page * page_size, count), count
+        ),
+        (
             {
-                "pk": calc.pk,
-                "label": calc.label,
-                "code": calc.code.label,
-                "computer": calc.code.computer.label,
-                "status": calc.status.step,
+                "pk": code.pk,
+                "label": code.label,
+                "client_pk": code.client_pk,
+                "client_label": code.client.label,
             }
-        )
-    click.echo(yaml.safe_dump(data, default_flow_style=False, sort_keys=False))
+            for code in storage.iter_obj(orm.Code, page=page, page_size=page_size)
+        ),
+        ("PK", "pk"),
+        ("Label", "label"),
+        ("Client PK", "client_pk"),
+        ("Client Label", "client_label"),
+    )
+    console.print(table)
+
+
+@app_calcjob.command("tree")
+def calcjob_tree(
+    ctx: typer.Context,
+    page: int = typer.Option(1, help="The page of results to show"),
+    page_size: int = typer.Option(100, help="The number of results per page"),
+) -> None:
+    """Tree of Client :left_arrow_curving_right: Code :left_arrow_curving_right: CalcJob."""
+    storage = ctx.ensure_object(StorageContext).storage
+    count = storage.count_obj(orm.CalcJob)
+    tree = Tree(
+        "[bold]Calcjobs[/bold] {}-{} of {}".format(
+            (page - 1) * page_size + 1, min(page * page_size, count), count
+        ),
+        highlight=False,
+    )
+    client_nodes: t.Dict[int, Tree] = {}
+    code_nodes: t.Dict[int, Tree] = {}
+    for calcjob in storage.iter_obj(orm.CalcJob, page=page, page_size=page_size):
+        if calcjob.code.client.pk not in client_nodes:
+            client_nodes[calcjob.code.client.pk] = tree.add(
+                f"[blue]{calcjob.code.client.pk}[/blue] - {calcjob.code.client.label}"
+            )
+        if calcjob.code.pk not in code_nodes:
+            code_nodes[calcjob.code.pk] = client_nodes[calcjob.code.client.pk].add(
+                f"[blue]{calcjob.code.pk}[/blue] - {calcjob.code.label}"
+            )
+        code_nodes[calcjob.code.pk].add(f"[blue]{calcjob.pk}[/blue] - {calcjob.label}")
+        # TODO include status
+
+    console.print(tree)
+
+
+if __name__ == "__main__":
+    app_main()

@@ -35,5 +35,5 @@ repos:
           "aiohttp",
           "sqlalchemy==2.0.0rc2",
           "jinja2",
-          "click",
+          "typer[all]",
         ]

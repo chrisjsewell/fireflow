@@ -1,8 +1,8 @@
 """Database objects for data handling.
 
-Computer
+Client
     |_ Code
-       |_ Calculation <-> Processing
+       |_ CalcJob <-> Processing
             |_ DataNode
 
 See also: https://docs.sqlalchemy.org/en/20/orm/quickstart.html
@@ -16,6 +16,8 @@ import firecrest
 from sqlalchemy import JSON, Enum, ForeignKey, String, UniqueConstraint
 from sqlalchemy.ext.mutable import MutableDict, MutableList
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
+
+# TODO versioning
 
 
 class Base(DeclarativeBase):
@@ -41,10 +43,10 @@ class Base(DeclarativeBase):
         return hash(self.pk)
 
 
-class Computer(Base):
+class Client(Base):
     """Data for a single-user to interact with FirecREST."""
 
-    __tablename__ = "computer"
+    __tablename__ = "client"
 
     label: Mapped[str] = mapped_column(
         unique=True, default=lambda: random.choice(NAMES)
@@ -69,7 +71,7 @@ class Computer(Base):
     """The maximum size of a file that can be uploaded directly, in MB."""
 
     codes: Mapped[List["Code"]] = relationship("Code")
-    """The codes that are associated with this computer."""
+    """The codes that are associated with this client."""
 
     @property
     def work_path(self) -> Union[PurePosixPath, PureWindowsPath]:
@@ -101,26 +103,26 @@ class Code(Base):
     """Data for a single code."""
 
     __tablename__ = "code"
-    __table_args__ = (UniqueConstraint("computer_pk", "label"),)
+    __table_args__ = (UniqueConstraint("client_pk", "label"),)
 
     def __str__(self) -> str:
         return f"{self.__class__.__name__}({self.pk}, {self.label})"
 
     label: Mapped[str] = mapped_column(default=lambda: random.choice(NAMES))
 
-    computer_pk: Mapped[int] = mapped_column(ForeignKey("computer.pk"))
-    """The primary key of the computer that this calculation is associated with."""
-    computer: Mapped[Computer] = relationship("Computer", back_populates="codes")
-    """The computer that this calculation is associated with."""
+    client_pk: Mapped[int] = mapped_column(ForeignKey("client.pk"))
+    """The primary key of the client that this code is associated with."""
+    client: Mapped[Client] = relationship("Client", back_populates="codes")
+    """The client that this code is associated with."""
 
     script: Mapped[str]
     """The batch script template to submit to the scheduler on the remote machine.
 
     This can use jinja2 placeholders:
 
-    - `{{ comp }}` the computer object.
+    - `{{ client }}` the client object.
     - `{{ code }}` the code object.
-    - `{{ calc }}` the calculation object.
+    - `{{ calc }}` the calcjob object.
 
     """
 
@@ -134,14 +136,14 @@ class Code(Base):
     - `key` pointing to the file in the object store, or None if a directory.
     """
 
-    calculations: Mapped[List["Calculation"]] = relationship("Calculation")
-    """The calculations that are associated with this code."""
+    calcjobs: Mapped[List["CalcJob"]] = relationship("CalcJob")
+    """The calcjobs that are associated with this code."""
 
 
-class Calculation(Base):
-    """Input data for a single calculation."""
+class CalcJob(Base):
+    """Input data for a single calculation job."""
 
-    __tablename__ = "calculation"
+    __tablename__ = "calcjob"
 
     label: Mapped[str] = mapped_column(default="")
 
@@ -149,9 +151,9 @@ class Calculation(Base):
     """The unique identifier, for remote folder creation."""
 
     code_pk: Mapped[int] = mapped_column(ForeignKey("code.pk"))
-    """The primary key of the code that this calculation is associated with."""
-    code: Mapped[Code] = relationship("Code", back_populates="calculations")
-    """The code that this calculation is associated with."""
+    """The primary key of the code that this calcjob is associated with."""
+    code: Mapped[Code] = relationship("Code", back_populates="calcjobs")
+    """The code that this calcjob is associated with."""
 
     parameters: Mapped[Dict[str, Any]] = mapped_column(
         MutableDict.as_mutable(JSON()), default=dict
@@ -178,33 +180,31 @@ class Calculation(Base):
     status: Mapped["Processing"] = relationship(
         "Processing", single_parent=True, cascade="all, delete-orphan"
     )
-    """The processing status of the calculation."""
+    """The processing status of the calcjob."""
 
     outputs: Mapped[List["DataNode"]] = relationship(
         "DataNode", cascade="all, delete-orphan"
     )
-    """The outputs of the calculation."""
+    """The outputs of the calcjob."""
 
     @property
     def remote_path(self) -> Union[PurePosixPath, PureWindowsPath]:
-        """Return the remote path for the calculation execution."""
-        return self.code.computer.work_path / "workflows" / self.uuid
+        """Return the remote path for the calcjob execution."""
+        return self.code.client.work_path / "workflows" / self.uuid
 
 
 class Processing(Base):
-    """The processing status of a single running calculation."""
+    """The processing status of a single running calcjob."""
 
-    __tablename__ = "calculation_status"
+    __tablename__ = "calcjob_status"
 
     def __str__(self) -> str:
-        return f"{self.__class__.__name__}({self.pk}, calc={self.calculation_pk})"
+        return f"{self.__class__.__name__}({self.pk}, calc={self.calcjob_pk})"
 
-    calculation_pk: Mapped[int] = mapped_column(ForeignKey("calculation.pk"))
+    calcjob_pk: Mapped[int] = mapped_column(ForeignKey("calcjob.pk"))
     """The primary key of the calculation that this status is associated with."""
-    calculation: Mapped[Calculation] = relationship(
-        "Calculation", back_populates="status"
-    )
-    """The calculation that this status is associated with."""
+    calcjob: Mapped[CalcJob] = relationship("CalcJob", back_populates="status")
+    """The calcjob that this status is associated with."""
 
     step: Mapped[
         Literal[
@@ -216,17 +216,17 @@ class Processing(Base):
         ),
         default="created",
     )
-    """The step of the calculation."""
+    """The step of the calcjob."""
 
     job_id: Mapped[Optional[str]]
-    """The job id of the calculation, set by the scheduler."""
+    """The job id of the calcjob, set by the scheduler."""
 
     exception: Mapped[Optional[str]]
     """The exception that was raised, if any."""
 
 
 class DataNode(Base):
-    """Data node to input or output from a calculation."""
+    """Data node to input or output from a calcjob."""
 
     __tablename__ = "data"
 
@@ -236,10 +236,10 @@ class DataNode(Base):
     """JSONable data to store on the node."""
 
     # TODO allow for this to not be set?
-    creator_pk: Mapped[int] = mapped_column(ForeignKey("calculation.pk"))
-    """The primary key of the calculation that created this node."""
-    creator: Mapped[Calculation] = relationship("Calculation", back_populates="outputs")
-    """The calculation that created this node."""
+    creator_pk: Mapped[int] = mapped_column(ForeignKey("calcjob.pk"))
+    """The primary key of the calcjob that created this node."""
+    creator: Mapped[CalcJob] = relationship("CalcJob", back_populates="outputs")
+    """The calcjob that created this node."""
 
 
 NAMES: Tuple[str, ...] = (

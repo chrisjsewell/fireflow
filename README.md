@@ -15,8 +15,8 @@ After installing the package, the `fc-wkflow` command is available.
 You can then create a workflow database from a YAML file, such as `example_setup.yml`:
 
 ```yaml
-computers:
-- label: test-computer
+clients:
+- label: test-client
   client_url: "http://localhost:8000/"
   client_id: "firecrest-sample"
   client_secret: "b391e177-fa50-4987-beaf-e6d33ca93571"
@@ -31,13 +31,13 @@ computers:
       #SBATCH --job-name={{ calc.uuid }}
       mkdir -p output
       echo '{{ calc.parameters.echo_string }}' > output.txt
-    calculations:
-    - label: test-calculation1
+    calcjobs:
+    - label: test-calcjob1
       parameters:
         echo_string: "Hello world!"
       download_globs:
       - output.txt
-    - label: test-calculation2
+    - label: test-calcjob2
       parameters:
         echo_string: "Hello world 2!"
       download_globs:
@@ -46,23 +46,18 @@ computers:
 
 Then run `fc-wkflow create example_setup.yaml`, which will create a database in a `wkflow_storage` folder.
 
-You can list all the calculations with:
+You can list all the calcjobs with:
 
 ```console
-$ fc-wkflow calculation list
-- pk: 1
-  label: test-calculation1
-  code: test-code1
-  computer: test-computer
-  status: created
-- pk: 2
-  label: test-calculation2
-  code: test-code1
-  computer: test-computer
-  status: created
+$ fc-wkflow calcjob tree
+Calcjobs 1-2 of 2
+└── 1 - test-client
+    └── 1 - test-code1
+        ├── 1 - test-calcjob1
+        └── 2 - test-calcjob2
 ```
 
-You can then run all the calculations with:
+You can then run all the calcjobs with:
 
 ```console
 $ fc-wkflow run
@@ -80,7 +75,7 @@ $ fc-wkflow run
 2023-01-30 09:22:43:firecrest_wflow.process:INFO: parsing output files: /var/folders/t2/xbl15_3n4tsb1vr_ccmmtmbr0000gn/T/tmp9gcqzae4
 ```
 
-The calculations run asynchronously, with the steps:
+The calcjobs run asynchronously, with the steps:
 
 - `prepare for submission`: create the job script
 - `copying to remote folder`: copy the job script and input files to the remote folder
@@ -92,3 +87,10 @@ The calculations run asynchronously, with the steps:
 ## Aims
 
 - Minimise the number of requests to the server
+
+## Upstream o AiiDA
+
+- Print the job script, for debugging
+- Add customisation of `sqlalchemy.engine` logging https://docs.sqlalchemy.org/en/20/core/engines.html#configuring-logging
+
+https://chat.openai.com/chat/e453e10b-19fd-46a8-9cfb-0c8d31d1a60d

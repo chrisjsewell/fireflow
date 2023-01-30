@@ -10,7 +10,7 @@ import sqlalchemy as sa
 import sqlalchemy.orm as orm
 
 from ._object_store import FileObjectStore, InMemoryObjectStore, ObjectStore
-from ._orm import Base, Calculation, Code, Computer, Processing
+from ._orm import Base, CalcJob, Client, Code, Processing
 
 LOGGER = logging.getLogger(__name__)
 
@@ -58,20 +58,17 @@ class Storage:
         return self._object_store
 
     def _save_to_db(self, obj: Base) -> None:
-        """Save the calculation."""
+        """Save an ORM object to the database."""
         LOGGER.debug("Saving row %s", obj)
         self._session.add(obj)
         self._session.commit()
 
-    def save_computer(self, computer: Computer) -> Computer:
-        """Add a computer."""
-        if (
-            computer.pk is not None
-            and self._session.get(Computer, computer.pk) is not None
-        ):
-            raise ValueError(f"{computer} already saved")
-        self._save_to_db(computer)
-        return computer
+    def save_client(self, client: Client) -> Client:
+        """Add a client."""
+        if client.pk is not None and self._session.get(Client, client.pk) is not None:
+            raise ValueError(f"{client} already saved")
+        self._save_to_db(client)
+        return client
 
     def save_code(self, code: Code) -> Code:
         """Add a code."""
@@ -86,35 +83,70 @@ class Storage:
         self._save_to_db(code)
         return code
 
-    def save_calculation(self, calculation: Calculation) -> Calculation:
-        """Add a calculation."""
+    def save_calcjob(self, calcjob: CalcJob) -> CalcJob:
+        """Add a calcjob."""
         if (
-            calculation.pk is not None
-            and self._session.get(Calculation, calculation.pk) is not None
+            calcjob.pk is not None
+            and self._session.get(CalcJob, calcjob.pk) is not None
         ):
-            raise ValueError(f"{calculation} already saved")
+            raise ValueError(f"{calcjob} already saved")
         # validate download paths
-        for path, key in (calculation.upload or {}).items():
+        for path, key in (calcjob.upload or {}).items():
             if posixpath.isabs(path):
                 raise ValueError(f"Download path must be relative: {path}")
             if key is not None and key not in self._object_store:
                 raise ValueError(f"Download path key not in object store: {key}")
-        if calculation.status is None:
-            calculation.status = Processing()
-        self._save_to_db(calculation)
-        return calculation
+        if calcjob.status is None:
+            calcjob.status = Processing()
+        self._save_to_db(calcjob)
+        return calcjob
 
     def update_processing(self, processing: Processing) -> None:
         """Update the processing status."""
         self._save_to_db(processing)
 
-    def all(self, obj_cls: type[ORM_TYPE]) -> Iterable[ORM_TYPE]:
-        """Select all computers."""
-        for obj in self._session.scalars(sa.select(obj_cls)):
+    def count_obj(
+        self, obj_cls: type[ORM_TYPE], *, filters: Sequence[sa.ColumnElement[bool]] = ()
+    ) -> int:
+        """Count ORM objects of a particular type
+
+        :param obj_cls: The class of the objects to select
+        :param filters: Additional filters to apply (joined with AND)
+        """
+        selector = sa.select(obj_cls)
+        selector = selector.order_by(obj_cls.pk)
+        if filters:
+            selector = selector.where(sa.and_(*filters))
+        return self._session.execute(  # type: ignore
+            sa.select(sa.func.count()).select_from(selector.subquery())
+        ).scalar_one()
+
+    def iter_obj(
+        self,
+        obj_cls: type[ORM_TYPE],
+        *,
+        page_size: int | None = None,
+        page: int = 1,
+        filters: Sequence[sa.ColumnElement[bool]] = (),
+    ) -> Iterable[ORM_TYPE]:
+        """Iterate over ORM objects of a particular type
+
+        :param obj_cls: The class of the objects to select
+        :param page_size: The number of objects to select per page
+        :param page_number: The page number to select
+        :param filters: Additional filters to apply (joined with AND)
+        """
+        selector = sa.select(obj_cls)
+        selector = selector.order_by(obj_cls.pk)
+        if page_size is not None:
+            selector = selector.limit(page_size).offset((page - 1) * page_size)
+        if filters:
+            selector = selector.where(sa.and_(*filters))
+        for obj in self._session.scalars(selector):
             yield obj
 
     def get_unfinished(self, limit: None | int = None) -> Sequence[Processing]:
-        """Get unfinished calculations, that have not previously excepted."""
+        """Get unfinished calcjobs, that have not previously excepted."""
         stmt = (
             sa.select(Processing)
             .where(Processing.step != "finalised")
@@ -124,7 +156,7 @@ class Storage:
             stmt = stmt.limit(limit)
         return self._session.scalars(stmt).all()
 
-    def from_yaml(self, path: str) -> None:
+    def from_yaml(self, path: str | Path) -> None:
         """Load from a yaml file."""
         # TODO this is a bit of a hack, but it's a good way to get started
         # add schema validation of the file
@@ -133,11 +165,11 @@ class Storage:
         with open(path) as handle:
             data = yaml.safe_load(handle)
 
-        for computer_data in data["computers"]:
-            codes = computer_data.pop("codes")
-            computer = self.save_computer(Computer(**computer_data))
+        for client_data in data["clients"]:
+            codes = client_data.pop("codes")
+            client = self.save_client(Client(**client_data))
             for code_data in codes:
-                calculations = code_data.pop("calculations")
-                code = self.save_code(Code(**code_data, computer=computer))
-                for calculation_data in calculations:
-                    self.save_calculation(Calculation(**calculation_data, code=code))
+                calcjobs = code_data.pop("calcjobs")
+                code = self.save_code(Code(**code_data, client=client))
+                for calcjob_data in calcjobs:
+                    self.save_calcjob(CalcJob(**calcjob_data, code=code))

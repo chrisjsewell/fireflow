@@ -1,4 +1,4 @@
-"""Run calculations via FirecREST."""
+"""Run calcjobs via FirecREST."""
 from __future__ import annotations
 
 import asyncio
@@ -19,7 +19,7 @@ import aiohttp
 import firecrest
 import jinja2
 
-from firecrest_wflow._orm import Calculation, DataNode, Processing
+from firecrest_wflow._orm import CalcJob, DataNode, Processing
 from firecrest_wflow.patches import ls_recurse
 from firecrest_wflow.storage import Storage
 
@@ -28,17 +28,15 @@ LOGGER = logging.getLogger(__name__)
 JOB_NAME = "job.sh"
 
 
-def run_unfinished_calculations(storage: Storage, limit: None | int = None) -> None:
-    """Run all unfinished calculations."""
+def run_unfinished_calcjobs(storage: Storage, limit: None | int = None) -> None:
+    """Run all unfinished calcjobs."""
     running = storage.get_unfinished(limit)
-    asyncio.run(run_multiple_calculations(running, storage))
+    asyncio.run(run_multiple_calcjobs(running, storage))
 
 
-async def run_multiple_calculations(
-    calcs: Sequence[Processing], storage: Storage
-) -> None:
-    """Run multiple calculations."""
-    await asyncio.gather(*[run_calculation(calc, storage) for calc in calcs])
+async def run_multiple_calcjobs(calcs: Sequence[Processing], storage: Storage) -> None:
+    """Run multiple calcjobs."""
+    await asyncio.gather(*[run_calcjob(calc, storage) for calc in calcs])
 
 
 async def reliquish() -> None:
@@ -46,13 +44,13 @@ async def reliquish() -> None:
     await asyncio.sleep(0)
 
 
-async def run_calculation(process: Processing, storage: Storage) -> None:
-    """Run a single calculation."""
+async def run_calcjob(process: Processing, storage: Storage) -> None:
+    """Run a single calcjob."""
     while process.step != "finalised":
         try:
             await run_step(process, storage)
         except Exception as exc:
-            LOGGER.exception("Error running calculation %s", process.calculation.uuid)
+            LOGGER.exception("Error running calcjob %s", process.calcjob.uuid)
             exc_str = f"{type(exc).__name__}: {exc}"
             process.exception = exc_str
             break
@@ -61,12 +59,12 @@ async def run_calculation(process: Processing, storage: Storage) -> None:
 
 
 async def run_step(status: Processing, storage: Storage) -> None:
-    """Run a single step of a computation."""
+    """Run a single step of a calcjob."""
 
     # TODO would like to move this to pattern matching, but ruff does not support it:
     # https://github.com/charliermarsh/ruff/issues/282
 
-    calc = status.calculation
+    calc = status.calcjob
 
     if status.step == "created":
         status.step = "uploading"
@@ -91,13 +89,15 @@ async def run_step(status: Processing, storage: Storage) -> None:
 
 
 async def prepare_for_submission(
-    calc: Calculation, local_path: Path, storage: Storage
+    calc: CalcJob, local_path: Path, storage: Storage
 ) -> None:
     """Prepares the (local) calculation folder with all inputs,
     ready to be copied to the compute resource.
     """
     LOGGER.info("prepare for submission: %s", calc.uuid)
-    job_script = jinja2.Template(calc.code.script).render(calc=calc)
+    job_script = jinja2.Template(calc.code.script).render(
+        calc=calc, code=calc.code, client=calc.code.client
+    )
     local_path.joinpath(JOB_NAME).write_text(job_script, encoding="utf-8")
     for rel_path, key in calc.upload.items():
         path = local_path.joinpath(*posixpath.split(rel_path))
@@ -119,29 +119,29 @@ async def poll_object_transfer(
         await asyncio.sleep(interval)
 
 
-async def copy_to_remote(calc: Calculation, local_folder: Path) -> None:
+async def copy_to_remote(calc: CalcJob, local_folder: Path) -> None:
     """Copy the calculation inputs to the compute resource."""
-    computer = calc.code.computer
+    client_row = calc.code.client
     remote_folder = calc.remote_path
     LOGGER.info("copying to remote folder: %s", remote_folder)
-    client = computer.client
-    client.mkdir(computer.machine_name, str(remote_folder), p=True)
+    client = client_row.client
+    client.mkdir(client_row.machine_name, str(remote_folder), p=True)
     for local_path in local_folder.glob("**/*"):
         target_path = remote_folder.joinpath(
             *local_path.relative_to(local_folder).parts
         )
         LOGGER.debug("copying to remote: %s", target_path)
         if local_path.is_dir():
-            client.mkdir(computer.machine_name, str(target_path), p=True)
+            client.mkdir(client_row.machine_name, str(target_path), p=True)
         if local_path.is_file():
-            if computer.small_file_size_mb * 1024 * 1024 > local_path.stat().st_size:
+            if client_row.small_file_size_mb * 1024 * 1024 > local_path.stat().st_size:
                 client.simple_upload(
-                    computer.machine_name, str(local_path), str(target_path.parent)
+                    client_row.machine_name, str(local_path), str(target_path.parent)
                 )
                 await reliquish()
             else:
                 up_obj = client.external_upload(
-                    computer.machine_name, str(local_path), str(target_path.parent)
+                    client_row.machine_name, str(local_path), str(target_path.parent)
                 )
                 # Note, here we do not use pyfirecrest's finish_upload,
                 # since it simply runs a subprocess to do the upload (calling curl)
@@ -155,47 +155,47 @@ async def copy_to_remote(calc: Calculation, local_folder: Path) -> None:
                 await poll_object_transfer(up_obj)
 
 
-async def submit_on_remote(calc: Calculation) -> None:
-    """Run the calculation on the compute resource."""
-    computer = calc.code.computer
+async def submit_on_remote(calc: CalcJob) -> None:
+    """Run the calcjob on the compute resource."""
+    client_row = calc.code.client
     script_path = calc.remote_path / JOB_NAME
     LOGGER.info("submitting on remote: %s", script_path)
-    client = computer.client
-    result = client.submit(computer.machine_name, str(script_path), local_file=False)
+    client = client_row.client
+    result = client.submit(client_row.machine_name, str(script_path), local_file=False)
     calc.status.job_id = result["jobid"]
 
 
 async def poll_until_finished(
-    calc: Calculation, interval: int = 1, timeout: int | None = 60
+    calc: CalcJob, interval: int = 1, timeout: int | None = 60
 ) -> None:
-    """Poll the compute resource until the calculation is finished."""
+    """Poll the compute resource until the calcjob is finished."""
     LOGGER.info("polling job until finished: %s", calc.uuid)
-    computer = calc.code.computer
-    client = computer.client
+    client_row = calc.code.client
+    client = client_row.client
     start = time.time()
     while timeout is None or (time.time() - start) < timeout:
-        results = client.poll(computer.machine_name, [calc.status.job_id])
+        results = client.poll(client_row.machine_name, [calc.status.job_id])
         if results and results[0]["state"] == "COMPLETED":
             break
         await asyncio.sleep(interval)
     else:
-        raise RuntimeError("timeout waiting for calculation to finish")
+        raise RuntimeError("timeout waiting for calcjob to finish")
 
 
-async def copy_from_remote(calc: Calculation, local_folder: Path) -> None:
-    """Copy the calculation outputs from the compute resource."""
+async def copy_from_remote(calc: CalcJob, local_folder: Path) -> None:
+    """Copy the calcjob outputs from the compute resource."""
     # TODO this should take the calc.download_globs, and only copy those
     # directly into the object storage
     # before downloading, we can also get the checksum to see if it is already in the store
     # once its in the store, then we want to update the calc process,
     # to record the (POSIX) path we retrieved
 
-    computer = calc.code.computer
+    client_row = calc.code.client
     remote_folder = calc.remote_path
     LOGGER.info("copying from remote folder: %s", remote_folder)
-    client = computer.client
+    client = client_row.client
     for item in ls_recurse(
-        client, computer.machine_name, str(remote_folder), show_hidden=True
+        client, client_row.machine_name, str(remote_folder), show_hidden=True
     ):
         if item["type"] == "-":
             remote_path = remote_folder / item["path"]
@@ -204,14 +204,14 @@ async def copy_from_remote(calc: Calculation, local_folder: Path) -> None:
                 *remote_path.relative_to(remote_folder).parts
             )
             local_path.parent.mkdir(parents=True, exist_ok=True)
-            if computer.small_file_size_mb * 1024 * 1024 > int(item["size"]):
+            if client_row.small_file_size_mb * 1024 * 1024 > int(item["size"]):
                 client.simple_download(
-                    computer.machine_name, str(remote_path), str(local_path)
+                    client_row.machine_name, str(remote_path), str(local_path)
                 )
                 await reliquish()
             else:
                 down_obj = client.external_download(
-                    computer.machine_name, str(remote_path)
+                    client_row.machine_name, str(remote_path)
                 )
                 await poll_object_transfer(down_obj)
 
@@ -239,7 +239,7 @@ async def copy_from_remote(calc: Calculation, local_folder: Path) -> None:
                 down_obj.invalidate_object_storage_link()
 
 
-async def parse_output_files(calc: Calculation, local_path: Path) -> None:
+async def parse_output_files(calc: CalcJob, local_path: Path) -> None:
     """Parse the calculation outputs."""
     LOGGER.info("parsing output files: %s", local_path)
     paths = []

@@ -4,8 +4,8 @@ from __future__ import annotations
 import logging
 from textwrap import dedent
 
-from firecrest_wflow._orm import Calculation, Code, Computer
-from firecrest_wflow.process import run_unfinished_calculations
+from firecrest_wflow._orm import CalcJob, Client, Code
+from firecrest_wflow.process import run_unfinished_calcjobs
 from firecrest_wflow.storage import Storage
 
 
@@ -17,10 +17,12 @@ def main() -> None:
         datefmt="%Y-%m-%d %H:%M:%S",
         level=logging.INFO,
     )
+    # logging.getLogger("sqlalchemy.engine").setLevel(logging.INFO)
 
-    storage = Storage.in_memory()
+    # storage = Storage.in_memory()
+    storage = Storage.on_file("wkflow_storage2", init=True)
 
-    computer = Computer(
+    client = Client(
         client_url="http://localhost:8000/",
         client_id="firecrest-sample",
         client_secret="b391e177-fa50-4987-beaf-e6d33ca93571",
@@ -29,16 +31,17 @@ def main() -> None:
         work_dir="/home/service-account-firecrest-sample",
         small_file_size_mb=5,
     )
-    storage.save_computer(computer)
+    storage.save_client(client)
 
     code = Code(
-        computer=computer,
+        client=client,
         script=dedent(
             """\
             #!/bin/bash
             #SBATCH --job-name={{calc.uuid}}
 
             mkdir -p output
+            sleep 30
             echo 'Hello world!' > output.txt
             """,
         ),
@@ -48,11 +51,11 @@ def main() -> None:
     key = storage.objects.add_from_bytes(b"Hello world!", "txt")
 
     for _ in range(2):
-        storage.save_calculation(Calculation(code=code, upload={"input.txt": key}))
-    run_unfinished_calculations(storage)
+        storage.save_calcjob(CalcJob(code=code, upload={"input.txt": key}))
+    run_unfinished_calcjobs(storage)
 
-    print("calculations:")  # noqa: T201
-    for calc in storage.all(Calculation):
+    print("calcjobs:")  # noqa: T201
+    for calc in storage.iter_obj(CalcJob):
         print(" ", calc, calc.code)  # noqa: T201
         print("  ", "outputs:")  # noqa: T201
         for node in calc.outputs:
