@@ -23,7 +23,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-cli = ["typer[all]~=0.7.0", "click-config-file", "pyyaml"]
+cli = ["typer[all]~=0.7.0", "pyyaml"]
 testing = ["pytest"]
 
 [project.scripts]
@@ -52,8 +52,6 @@ strict = true
 [[tool.mypy.overrides]]
 module = [
     "firecrest.*",
-    "tomllib.*",
     "yaml.*",
-    "click_config_file.*",
 ]
 ignore_missing_imports = true

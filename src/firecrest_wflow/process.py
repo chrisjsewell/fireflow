@@ -19,7 +19,7 @@ import aiohttp
 import firecrest
 import jinja2
 
-from firecrest_wflow._orm import CalcJob, DataNode, Processing
+from firecrest_wflow.orm import CalcJob, DataNode, Processing
 from firecrest_wflow.patches import ls_recurse
 from firecrest_wflow.storage import Storage
 
@@ -247,7 +247,7 @@ async def parse_output_files(calc: CalcJob, local_path: Path) -> None:
         paths.append(
             path.relative_to(local_path).as_posix() + ("/" if path.is_dir() else "")
         )
-    calc.outputs.append(DataNode(attributes={"paths": paths}))
+    DataNode(attributes={"paths": paths}, creator_pk=calc.pk)
 
 
 # HELPER functions

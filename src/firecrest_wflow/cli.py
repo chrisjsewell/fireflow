@@ -11,8 +11,7 @@ from rich.tree import Tree
 import typer
 import yaml
 
-from firecrest_wflow import __version__
-from firecrest_wflow import _orm as orm
+from firecrest_wflow import __version__, orm
 from firecrest_wflow.process import run_unfinished_calcjobs
 from firecrest_wflow.storage import Storage
 
@@ -43,6 +42,7 @@ app_main.add_typer(
 )
 
 # TODO how to order typers in help panel?
+# TODO handle exceptions better, only showing traceback if --debug is set
 
 
 def version_callback(value: bool) -> None:
@@ -70,7 +70,6 @@ def config_callback(
     ctx: typer.Context, param: typer.CallbackParam, value: t.Optional[Path]
 ) -> t.Optional[Path]:
     if value is not None:
-        typer.echo(f"Loading config file: {value}")
         try:
             with open(value, "r") as f:  # Load config file
                 conf = yaml.safe_load(f)
@@ -92,14 +91,23 @@ class StorageContext:
         self._storage: t.Optional[Storage] = None
 
     def __str__(self) -> str:
-        return f"StorageContext({str(self._storage_dir)!r})"
+        return f"StorageContext({str(self.path)!r})"
+
+    @property
+    def path(self) -> Path:
+        """Get the storage path."""
+        return self._storage_dir
 
     @property
     def storage(self) -> Storage:
         """Get the storage."""
         if self._storage is None:
-            self._storage = Storage.on_file(self._storage_dir, init=True)
+            self._storage = Storage.on_file(self._storage_dir, init=False)
         return self._storage
+
+    def init(self) -> None:
+        """Initialize the storage."""
+        self._storage = Storage.on_file(self._storage_dir, init=True)
 
 
 @app_main.callback()
@@ -138,9 +146,13 @@ def main_init(
     ),
 ) -> None:
     """Initialize the storage."""
-    storage = ctx.ensure_object(StorageContext).storage
+    storage = ctx.ensure_object(StorageContext)
+    storage.init()
     if config is not None:
-        storage.from_yaml(config)
+        storage.storage.from_yaml(config)
+    console.print(
+        f"[green]Storage initialized :white_check_mark:[/green]: {storage.path}"
+    )
 
 
 class LogLevel(str, Enum):
@@ -208,9 +220,36 @@ def client_create(
         machine_name=machine_name,
         work_dir=work_dir,
         small_file_size_mb=small_file_size_mb,
-        label=label,
     )
+    if label is not None:
+        client.label = label
     storage.save_client(client)
+    console.print("[green]Created client:[/green]")
+    console.print(client)
+
+
+@app_client.command("show")
+def client_show(
+    ctx: typer.Context,
+    pk: int = typer.Argument(..., help="Primary key of the client to show"),
+) -> None:
+    """Show a client."""
+    storage = ctx.ensure_object(StorageContext).storage
+    client = storage.get_obj(orm.Client, pk)
+    console.print(client)
+
+
+@app_client.command("delete")
+def client_delete(
+    ctx: typer.Context,
+    pk: int = typer.Argument(..., help="Primary key of the client to delete"),
+) -> None:
+    """Delete a client."""
+    storage = ctx.ensure_object(StorageContext).storage
+    client = storage.get_obj(orm.Client, pk)
+    typer.confirm(f"Are you sure you want to delete PK={pk}?", abort=True)
+    storage.delete_obj(client)
+    console.print(f"[green]Deleted Client {pk}[/green]")
 
 
 @app_client.command("list")
@@ -243,6 +282,30 @@ def client_list(
         ("Machine", "machine_name"),
     )
     console.print(table)
+
+
+@app_code.command("show")
+def code_show(
+    ctx: typer.Context,
+    pk: int = typer.Argument(..., help="Primary key of the code to show"),
+) -> None:
+    """Show a code."""
+    storage = ctx.ensure_object(StorageContext).storage
+    code = storage.get_obj(orm.Code, pk)
+    console.print(code)
+
+
+@app_code.command("delete")
+def code_delete(
+    ctx: typer.Context,
+    pk: int = typer.Argument(..., help="Primary key of the code to delete"),
+) -> None:
+    """Delete a client."""
+    storage = ctx.ensure_object(StorageContext).storage
+    code = storage.get_obj(orm.Code, pk)
+    typer.confirm(f"Are you sure you want to delete PK={pk}?", abort=True)
+    storage.delete_obj(code)
+    console.print(f"[green]Deleted Code {pk}[/green]")
 
 
 @app_code.command("tree")
@@ -298,6 +361,35 @@ def code_list(
         ("Client Label", "client_label"),
     )
     console.print(table)
+
+
+@app_calcjob.command("show")
+def calcjob_show(
+    ctx: typer.Context,
+    pk: int = typer.Argument(..., help="Primary key of the calcjob to show"),
+    show_process: bool = typer.Option(
+        False, "-p", "--process", help="Show also the process"
+    ),
+) -> None:
+    """Show a calcjob."""
+    storage = ctx.ensure_object(StorageContext).storage
+    calcjob = storage.get_obj(orm.CalcJob, pk)
+    console.print(calcjob)
+    if show_process:
+        console.print(calcjob.status)
+
+
+@app_calcjob.command("delete")
+def calcjob_delete(
+    ctx: typer.Context,
+    pk: int = typer.Argument(..., help="Primary key of the calcjob to delete"),
+) -> None:
+    """Delete a calcjob."""
+    storage = ctx.ensure_object(StorageContext).storage
+    calcjob = storage.get_obj(orm.CalcJob, pk)
+    typer.confirm(f"Are you sure you want to delete PK={pk}?", abort=True)
+    storage.delete_obj(calcjob)
+    console.print(f"[green]Deleted CalcJob {pk}[/green]")
 
 
 @app_calcjob.command("tree")
