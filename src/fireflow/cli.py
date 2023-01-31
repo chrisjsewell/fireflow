@@ -11,9 +11,9 @@ from rich.tree import Tree
 import typer
 import yaml
 
-from firecrest_wflow import __version__, orm
-from firecrest_wflow.process import run_unfinished_calcjobs
-from firecrest_wflow.storage import Storage
+from fireflow import __version__, orm
+from fireflow.process import run_unfinished_calcjobs
+from fireflow.storage import Storage
 
 console = Console()
 app_main = typer.Typer(
@@ -114,13 +114,13 @@ class StorageContext:
 def main_app(
     ctx: typer.Context,
     storage: Path = typer.Option(
-        "wkflow_storage",
-        "-s",
-        "--storage-dir",
+        ".fireflow_project",
+        "-p",
+        "--project-path",
         file_okay=False,
         dir_okay=True,
         resolve_path=True,
-        help="Path to the storage directory.",
+        help="Path to the project directory.",
     ),
     version: t.Optional[bool] = typer.Option(
         None,
@@ -145,7 +145,7 @@ def main_init(
         help="Path to a YAML configuration file.",
     ),
 ) -> None:
-    """Initialize the storage."""
+    """Initialize a project."""
     storage = ctx.ensure_object(StorageContext)
     storage.init()
     if config is not None:

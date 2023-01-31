@@ -3,7 +3,7 @@ requires = ["flit_core >=3.2,<4"]
 build-backend = "flit_core.buildapi"
 
 [project]
-name = "firecrest_wflow"
+name = "fireflow"
 dynamic = ["version", "description"]
 authors = [{name = "Chris Sewell", email = "chrisj_sewell@hotmail.com"}]
 readme = "README.md"
@@ -19,7 +19,7 @@ dependencies = [
     "aiohttp~=3.8",
     "aiofiles~=22.1",
     "sqlalchemy==2.0.0rc2",
-    "jinja2"
+    "jinja2",
 ]
 
 [project.optional-dependencies]
@@ -27,8 +27,7 @@ cli = ["typer[all]~=0.7.0", "pyyaml"]
 testing = ["pytest"]
 
 [project.scripts]
-fc-wkflow = "firecrest_wflow.cli:app_main"
-fc-wflow-mock = "firecrest_wflow._test:main"
+fireflow = "fireflow.cli:app_main"
 
 [project.urls]
 Home = "https://github.com/chrisjsewell/firecrest-workflows"
@@ -43,7 +42,7 @@ extend-select = ["B0", "C4", "ICN", "ISC", "N", "RUF", "SIM", "T20"]
 
 [tool.ruff.per-file-ignores]
 # ignore: Do not perform function call `typer.Option` in argument defaults
-"src/firecrest_wflow/cli.py" = ["B008"]
+"src/fireflow/cli.py" = ["B008"]
 
 [tool.mypy]
 show_error_codes = true

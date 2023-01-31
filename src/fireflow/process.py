@@ -19,9 +19,9 @@ import aiohttp
 import firecrest
 import jinja2
 
-from firecrest_wflow.orm import CalcJob, DataNode, Processing
-from firecrest_wflow.patches import ls_recurse
-from firecrest_wflow.storage import Storage
+from fireflow.orm import CalcJob, DataNode, Processing
+from fireflow.patches import ls_recurse
+from fireflow.storage import Storage
 
 LOGGER = logging.getLogger(__name__)
 
