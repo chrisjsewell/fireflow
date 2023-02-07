@@ -10,69 +10,72 @@ See also the <https://github.com/eth-cscs/firecrest> demo server.
 
 ## Usage
 
-After installing the package, the `fc-wkflow` command is available.
+After installing the package, the `fireflow` command is available.
 
 You can then create a workflow database from a YAML file, such as `example_setup.yml`:
 
 ```yaml
 clients:
-- label: test-client
-  client_url: "http://localhost:8000/"
-  client_id: "firecrest-sample"
-  client_secret: "b391e177-fa50-4987-beaf-e6d33ca93571"
-  token_uri: "http://localhost:8080/auth/realms/kcrealm/protocol/openid-connect/token"
-  machine_name: "cluster"
-  work_dir: "/home/service-account-firecrest-sample"
-  small_file_size_mb: 5
-  codes:
+  - label: test-client
+    client_url: "http://localhost:8000/"
+    client_id: "firecrest-sample"
+    client_secret: "b391e177-fa50-4987-beaf-e6d33ca93571"
+    token_uri: "http://localhost:8080/auth/realms/kcrealm/protocol/openid-connect/token"
+    machine_name: "cluster"
+    work_dir: "/home/service-account-firecrest-sample"
+    small_file_size_mb: 5
+codes:
   - label: test-code1
+    client_label: test-client
     script: |
       #!/bin/bash
       #SBATCH --job-name={{ calc.uuid }}
       mkdir -p output
       echo '{{ calc.parameters.echo_string }}' > output.txt
-    calcjobs:
-    - label: test-calcjob1
-      parameters:
-        echo_string: "Hello world!"
-      download_globs:
-      - output.txt
-    - label: test-calcjob2
-      parameters:
-        echo_string: "Hello world 2!"
-      download_globs:
-      - output.txt
+calcjobs:
+  - label: test-calcjob1
+    code_label: test-code1
+    parameters:
+      echo_string: "Hello world!"
+    download_globs:
+    - output.txt
+  - label: test-calcjob2
+    code_label: test-code1
+    parameters:
+      echo_string: "Hello world 2!"
+    download_globs:
+    - output.txt
 ```
 
-Then run `fc-wkflow create example_setup.yaml`, which will create a database in a `wkflow_storage` folder.
+Then run `fireflow init -a example_setup.yaml`, which will create a database in a `.fireflow_project` folder.
 
 You can list all the calcjobs with:
 
 ```console
-$ fc-wkflow calcjob tree
+$ fireflow calcjob tree
 Calcjobs 1-2 of 2
 └── 1 - test-client
     └── 1 - test-code1
-        ├── 1 - test-calcjob1
-        └── 2 - test-calcjob2
+        ├── 1 - test-calcjob1 ▶
+        └── 2 - test-calcjob2 ▶
 ```
 
 You can then run all the calcjobs with:
 
 ```console
-$ fc-wkflow run
-2023-01-30 09:22:32:firecrest_wflow.process:INFO: prepare for submission: 31c02ae1-062e-4f03-a77f-b128aa31c744
-2023-01-30 09:22:32:firecrest_wflow.process:INFO: copying to remote folder: /home/service-account-firecrest-sample/workflows/31c02ae1-062e-4f03-a77f-b128aa31c744
-2023-01-30 09:22:33:firecrest_wflow.process:INFO: prepare for submission: 3c118af8-3b30-4e2d-b788-e33920a068e9
-2023-01-30 09:22:33:firecrest_wflow.process:INFO: copying to remote folder: /home/service-account-firecrest-sample/workflows/3c118af8-3b30-4e2d-b788-e33920a068e9
-2023-01-30 09:22:33:firecrest_wflow.process:INFO: submitting on remote: /home/service-account-firecrest-sample/workflows/31c02ae1-062e-4f03-a77f-b128aa31c744/job.sh
-2023-01-30 09:22:35:firecrest_wflow.process:INFO: submitting on remote: /home/service-account-firecrest-sample/workflows/3c118af8-3b30-4e2d-b788-e33920a068e9/job.sh
-2023-01-30 09:22:37:firecrest_wflow.process:INFO: polling job until finished: 31c02ae1-062e-4f03-a77f-b128aa31c744
-2023-01-30 09:22:38:firecrest_wflow.process:INFO: polling job until finished: 3c118af8-3b30-4e2d-b788-e33920a068e9
-2023-01-30 09:22:39:firecrest_wflow.process:INFO: copying from remote folder: /home/service-account-firecrest-sample/workflows/31c02ae1-062e-4f03-a77f-b128aa31c744
-2023-01-30 09:22:40:firecrest_wflow.process:INFO: copying from remote folder: /home/service-account-firecrest-sample/workflows/3c118af8-3b30-4e2d-b788-e33920a068e9
-2023-01-30 09:22:43:firecrest_wflow.process:INFO: parsing output files: /var/folders/t2/xbl15_3n4tsb1vr_ccmmtmbr0000gn/T/tmp2gcuydfw
-2023-01-30 09:22:43:firecrest_wflow.process:INFO: parsing output files: /var/folders/t2/xbl15_3n4tsb1vr_ccmmtmbr0000gn/T/tmp9gcqzae4
+$ fireflow run
+2023-02-07 20:10:58:fireflow.process:REPORT: PK-1: Uploading files to remote
+2023-02-07 20:11:00:fireflow.process:REPORT: PK-2: Uploading files to remote
+2023-02-07 20:11:01:fireflow.process:REPORT: PK-1: submitting on remote
+2023-02-07 20:11:03:fireflow.process:REPORT: PK-2: submitting on remote
+2023-02-07 20:11:05:fireflow.process:REPORT: PK-1: polling job until finished
+2023-02-07 20:11:06:fireflow.process:REPORT: PK-2: polling job until finished
+2023-02-07 20:11:08:fireflow.process:REPORT: PK-1: copying from remote folder
+2023-02-07 20:11:09:fireflow.process:REPORT: PK-2: copying from remote folder
+2023-02-07 20:11:13:fireflow.process:REPORT: PK-1: parsing output files
+2023-02-07 20:11:13:fireflow.process:REPORT: PK-1: paths: ['job.sh', 'output.txt', 'slurm-147.out']
+2023-02-07 20:11:13:fireflow.process:REPORT: PK-2: parsing output files
+2023-02-07 20:11:13:fireflow.process:REPORT: PK-2: paths: ['slurm-148.out', 'job.sh', 'output.txt']
 ```
 
 The calcjobs run asynchronously, with the steps:
