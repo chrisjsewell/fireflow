@@ -3,13 +3,14 @@ from __future__ import annotations
 
 import asyncio
 from io import BytesIO
+from itertools import chain
 import logging
 import os
 from pathlib import Path
 import posixpath
 from tempfile import TemporaryDirectory
 import time
-from typing import Any, Sequence, TypedDict
+from typing import Any, BinaryIO, Sequence, TypedDict
 from urllib.parse import urlparse
 
 import aiofiles
@@ -142,51 +143,45 @@ async def copy_to_remote(calc: CalcJob, storage: Storage) -> None:
     )
     await reliquish()
 
-    # upload files / make directories specified on the calcjob
-    for rel_path, key in calc.upload_paths.items():
+    # upload files / make directories specified on the code and calcjob
+    for rel_path, key in chain(
+        calc.code.upload_paths.items(), calc.upload_paths.items()
+    ):
         remote_path = remote_folder.joinpath(*posixpath.split(rel_path))
         if key is None:
             client.mkdir(client_row.machine_name, str(remote_path), p=True)
         else:
             if remote_path.parent != remote_folder:
                 client.mkdir(client_row.machine_name, str(remote_path.parent), p=True)
-            with storage.objects.open(key) as obj:
-                # TODO big uploads
-                client.simple_upload(
-                    client_row.machine_name,
-                    obj,
-                    str(remote_path.parent),
-                    remote_path.name,
+            file_size = storage.objects.get_size(key)
+            if file_size <= client_row.small_file_size_mb * 1024 * 1024:
+                with storage.objects.open(key) as obj:
+                    # TODO big uqwploads
+                    client.simple_upload(
+                        client_row.machine_name,
+                        obj,
+                        str(remote_path.parent),
+                        remote_path.name,
+                    )
+                await reliquish()
+            else:
+                # Note, officially the API requires a sourcepath on disk,
+                # but really it is not necessary
+                # TODO await response from https://github.com/eth-cscs/firecrest/issues/174
+                up_obj = client.external_upload(
+                    client_row.machine_name, remote_path.name, str(remote_path.parent)
                 )
-        await reliquish()
-
-    # for local_path in local_folder.glob("**/*"):
-    #     target_path = remote_folder.joinpath(
-    #         *local_path.relative_to(local_folder).parts
-    #     )
-    #     LOGGER.debug("copying to remote: %s", target_path)
-    #     if local_path.is_dir():
-    #         client.mkdir(client_row.machine_name, str(target_path), p=True)
-    #     if local_path.is_file():
-    #         if client_row.small_file_size_mb * 1024 * 1024 > local_path.stat().st_size:
-    #             client.simple_upload(
-    #                 client_row.machine_name, str(local_path), str(target_path.parent)
-    #             )
-    #             await reliquish()
-    #         else:
-    #             up_obj = client.external_upload(
-    #                 client_row.machine_name, str(local_path), str(target_path.parent)
-    #             )
-    #             # Note, here we do not use pyfirecrest's finish_upload,
-    #             # since it simply runs a subprocess to do the upload (calling curl)
-    #             # instead we properly async the upload
-    #             # up_obj.finish_upload()
-    #             params = up_obj.object_storage_data["parameters"]
-    #             if os.environ.get("FIRECREST_DEMO"):
-    #                 # TODO this local fix for MACs was necessary for the demo
-    #                 params["url"] = params["url"].replace("192.168.220.19", "localhost")
-    #             await upload_file_to_url(local_path, params)
-    #             await poll_object_transfer(up_obj)
+                # Note, here we do not use pyfirecrest's finish_upload,
+                # since it simply runs a subprocess to do the upload (calling curl)
+                # instead we properly async the upload
+                # up_obj.finish_upload()
+                params = up_obj.object_storage_data["parameters"]
+                if os.environ.get("FIRECREST_LOCAL_TESTING"):
+                    # TODO this local fix for MACs was necessary for the demo
+                    params["url"] = params["url"].replace("192.168.220.19", "localhost")
+                with storage.objects.open(key) as handle:
+                    await upload_io_to_url(handle, remote_path.name, params)
+                await poll_object_transfer(up_obj)
 
 
 async def submit_on_remote(calc: CalcJob) -> None:
@@ -253,7 +248,7 @@ async def copy_from_remote(calc: CalcJob, local_folder: Path) -> None:
                 # we use an asynchoronous version of it
                 url = down_obj.object_storage_data
 
-                if os.environ.get("FIRECREST_DEMO"):
+                if os.environ.get("FIRECREST_LOCAL_TESTING"):
                     # TODO however the url above doesn't work locally, with the demo docker
                     # there was a fix already noted for MAC:url.replace("192.168.220.19", "localhost")
                     # however, this still gives a 403 error:
@@ -311,22 +306,23 @@ class UploadParameters(TypedDict):
     params: dict[str, str]
 
 
-async def upload_file_to_url(filepath: Path | str, params: UploadParameters) -> str:
+async def upload_io_to_url(
+    handle: BinaryIO, filename: str, params: UploadParameters
+) -> str:
     """Upload a file from a local file to a URL."""
-    # assert params["method"] == "POST" and not params["json"]
+    # TODO assert params["method"] == "POST" and not params["json"] ?
     async with aiohttp.ClientSession() as session:
-        with open(filepath, "rb") as f:
-            form = aiohttp.FormData()
-            form.add_field("file", f, filename=str(filepath))
-            for key, value in params["data"].items():
-                form.add_field(key, value)
-            async with session.post(
-                params["url"],
-                data=form,
-                headers=params["headers"],
-                params=params["params"],
-            ) as resp:
-                return await resp.text()
+        form = aiohttp.FormData()
+        form.add_field("file", handle, filename=filename)
+        for key, value in params["data"].items():
+            form.add_field(key, value)
+        async with session.post(
+            params["url"],
+            data=form,
+            headers=params["headers"],
+            params=params["params"],
+        ) as resp:
+            return await resp.text()
 
 
 async def download_url_to_file(url: str, filepath: Path | str) -> None:

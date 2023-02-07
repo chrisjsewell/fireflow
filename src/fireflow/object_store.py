@@ -8,7 +8,7 @@ from io import BytesIO
 from pathlib import Path
 import shutil
 import tempfile
-from typing import BinaryIO, Protocol
+from typing import BinaryIO, Iterable, Protocol
 
 COPY_BUFSIZE = 64 * 1024
 
@@ -28,6 +28,14 @@ class ObjectStore(ABC):
     to provide a simple way to record their encoding.
     Two files with the same hash but different extensions are not allowed.
     """
+
+    @abstractmethod
+    def count(self) -> int:
+        """Count the number of objects in the store."""
+
+    @abstractmethod
+    def keys(self) -> Iterable[str]:
+        """Iterate over the keys of the objects in the store."""
 
     @abstractmethod
     def add_from_bytes(self, obj: bytes, ext: str = "") -> str:
@@ -52,7 +60,7 @@ class ObjectStore(ABC):
         :raises ValueError: if the object is already in the store with a different extension.
         """
 
-    def add_from_path(self, path: Path, *, chunks: int = COPY_BUFSIZE) -> str:
+    def add_from_path(self, path: Path | str, *, chunks: int = COPY_BUFSIZE) -> str:
         """Add an object to the store idempotently and atomically.
 
         :param path: the path to the object
@@ -60,8 +68,9 @@ class ObjectStore(ABC):
         :return: the key of the object
         :raises ValueError: if the object is already in the store with a different extension.
         """
-        with open(path, "rb") as obj:
-            return self.add_from_io(obj, ext=path.suffix.lstrip("."), chunks=chunks)
+        _path = Path(path)
+        with open(_path, "rb") as obj:
+            return self.add_from_io(obj, ext=_path.suffix.lstrip("."), chunks=chunks)
 
     def add_from_glob(
         self, path: Path, glob: str, *, chunks: int = COPY_BUFSIZE
@@ -84,8 +93,15 @@ class ObjectStore(ABC):
         """Check if the object is in the store."""
 
     @abstractmethod
-    def extension(self, sha256: str) -> str:
+    def get_extension(self, sha256: str) -> str:
         """Get the file extension of the object.
+
+        :raises KeyError: if the object is not in the store.
+        """
+
+    @abstractmethod
+    def get_size(self, sha256: str) -> int:
+        """Get the size of the object in bytes.
 
         :raises KeyError: if the object is not in the store.
         """
@@ -102,6 +118,12 @@ class InMemoryObjectStore(ObjectStore):
     def __init__(self) -> None:
         """Initialize the store."""
         self._store: dict[str, tuple[str, bytes]] = {}
+
+    def count(self) -> int:
+        return len(self._store)
+
+    def keys(self) -> Iterable[str]:
+        return self._store.keys()
 
     def add_from_io(
         self, obj: BinaryStream, *, ext: str = "", chunks: int = COPY_BUFSIZE
@@ -122,8 +144,11 @@ class InMemoryObjectStore(ObjectStore):
     def __contains__(self, sha256: str) -> bool:
         return sha256 in self._store
 
-    def extension(self, sha256: str) -> str:
+    def get_extension(self, sha256: str) -> str:
         return self._store[sha256][0]
+
+    def get_size(self, sha256: str) -> int:
+        return len(self._store[sha256][1])
 
     def open(self, sha256: str) -> BinaryIO:
         return closing(BytesIO(self._store[sha256][1]))  # type: ignore[return-value]
@@ -134,11 +159,17 @@ class FileObjectStore(ObjectStore):
         """Initialize the store."""
         self._path = Path(path)
 
+    def count(self) -> int:
+        return sum(1 for _ in self._path.iterdir())
+
+    def keys(self) -> Iterable[str]:
+        return (p.name for p in self._path.iterdir())
+
     def add_from_bytes(self, obj: bytes, ext: str = "") -> str:
         sha256 = hashlib.sha256(obj).hexdigest()
 
         try:
-            stored_ext = self.extension(sha256)
+            stored_ext = self.get_extension(sha256)
         except KeyError:
             pass
         else:
@@ -180,7 +211,7 @@ class FileObjectStore(ObjectStore):
         sha256 = hasher.hexdigest()
 
         try:
-            stored_ext = self.extension(sha256)
+            stored_ext = self.get_extension(sha256)
         except KeyError:
             pass
         else:
@@ -209,9 +240,13 @@ class FileObjectStore(ObjectStore):
             return path
         raise KeyError(sha256)
 
-    def extension(self, sha256: str) -> str:
+    def get_extension(self, sha256: str) -> str:
         path = self._get_path(sha256)
         return path.name.split(".", 1)[-1]
+
+    def get_size(self, sha256: str) -> int:
+        path = self._get_path(sha256)
+        return path.stat().st_size
 
     def __contains__(self, sha256: str) -> bool:
         try:

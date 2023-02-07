@@ -4,7 +4,7 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 from sqlite3 import Connection as SQLite3Connection
-from typing import Any, Iterable, Sequence, TypedDict, TypeVar
+import typing as t  # import t.Any, t.Iterable, Sequence, TypedDict, TypeVar
 
 import sqlalchemy as sa
 from sqlalchemy import event
@@ -18,8 +18,8 @@ from . import orm
 LOGGER = logging.getLogger(__name__)
 
 
-ORM_TYPE = TypeVar("ORM_TYPE", bound=orm.Base)
-ANY_TYPE = TypeVar("ANY_TYPE")
+ORM_TYPE = t.TypeVar("ORM_TYPE", bound=orm.Base)
+ANY_TYPE = t.TypeVar("ANY_TYPE")
 
 
 @event.listens_for(sa.Engine, "connect")
@@ -154,7 +154,10 @@ class Storage:
             raise
 
     def count_rows(
-        self, obj_cls: type[ORM_TYPE], *, filters: Sequence[sa.ColumnElement[bool]] = ()
+        self,
+        obj_cls: type[ORM_TYPE],
+        *,
+        filters: t.Sequence[sa.ColumnElement[bool]] = (),
     ) -> int:
         """Count rows in a database table.
 
@@ -207,8 +210,8 @@ class Storage:
         *,
         page_size: int | None = None,
         page: int = 1,
-        filters: Sequence[sa.ColumnElement[bool]] = (),
-    ) -> Iterable[ORM_TYPE]:
+        filters: t.Sequence[sa.ColumnElement[bool]] = (),
+    ) -> t.Iterable[ORM_TYPE]:
         """Iterate over rows of a database table, represented by ORM objects.
 
         :param obj_cls: The class of the objects to select
@@ -225,7 +228,7 @@ class Storage:
         for obj in self._session.scalars(selector):
             yield self._create_immutable_obj(obj)
 
-    def save_from_dict(self, data: FromDictConfig) -> dict[str, Any]:
+    def save_from_dict(self, data: FromDictConfig) -> dict[str, t.Any]:
         """Load data to the store from a dict representation.
 
         :return: A dict of data added to the storage
@@ -236,6 +239,8 @@ class Storage:
         # TODO could use pydantic os something for this
         if not isinstance(data, dict):
             raise ValueError("Expected a dict at the top level")
+        if "objects" in data and not isinstance(data["objects"], dict):
+            raise ValueError("Expected a dict for key 'objects'")
         for key in ("clients", "codes", "calcjobs"):
             if key in data:
                 if not isinstance(data[key], list):  # type: ignore[literal-required]
@@ -243,6 +248,30 @@ class Storage:
                 for idx, item in enumerate(data[key]):  # type: ignore[literal-required]
                     if not isinstance(item, dict):
                         raise ValueError(f"Expected a dict for item '{key}[{idx}]'")
+
+        # add objects and create mapping of label to key
+        obj_label_to_key: dict[str, str] = {}
+        for obj_label, obj_content in data.get("objects", {}).items():
+            if not isinstance(obj_content, dict):
+                raise ValueError(f"Expected a dict for object '{obj_label}'")
+            if "content" in obj_content:
+                if not isinstance(obj_content["content"], str):
+                    raise ValueError(f"Expected a string for object '{obj_label}'")
+                encoding = obj_content.get("encoding", "utf8")
+                extension = obj_content.get("extension", "txt")
+                obj_label_to_key[obj_label] = self.objects.add_from_bytes(
+                    obj_content["content"].encode(encoding), ext=extension
+                )
+            elif "path" in obj_content:
+                if not isinstance(obj_content["path"], str):
+                    raise ValueError(f"Expected a string for object '{obj_label}'")
+                obj_label_to_key[obj_label] = self.objects.add_from_path(
+                    obj_content["path"]
+                )
+            else:
+                raise ValueError(
+                    f"Expected either 'content' or 'path' for object '{obj_label}'"
+                )
 
         # add in single transaction? (so we can rollback if there's an error)
         with self._session.begin_nested():
@@ -268,6 +297,9 @@ class Storage:
                     raise ValueError(
                         f"codes[{idx}]['client_label'] = {client_label!r} not found"
                     )
+                _convert_upload_paths(
+                    self.objects, code_data, obj_label_to_key, f"codes[{idx}]"
+                )
                 try:
                     code = orm.Code(**code_data, client_pk=client_pk)
                     self.save_row(code)
@@ -286,6 +318,9 @@ class Storage:
                     raise ValueError(
                         f"calcjobs[{idx}]['code_label'] = {code_label!r} not found"
                     )
+                _convert_upload_paths(
+                    self.objects, calcjob_data, obj_label_to_key, f"calcjobs[{idx}]"
+                )
                 try:
                     calcjob = orm.CalcJob(**calcjob_data, code_pk=code_pk)
                     self.save_row(calcjob)
@@ -296,7 +331,55 @@ class Storage:
         return added_pks
 
 
-class FromDictConfig(TypedDict, total=False):
-    clients: list[dict[str, Any]]
-    codes: list[dict[str, Any]]
-    calcjobs: list[dict[str, Any]]
+def _convert_upload_paths(
+    store: ostore.ObjectStore,
+    item: dict[str, t.Any],
+    label_to_key: dict[str, str],
+    prefix: str,
+) -> None:
+    if "upload_paths" not in item:
+        return
+    upload_paths = item["upload_paths"]
+    name = f"{prefix}[upload_paths]"
+    if not isinstance(upload_paths, dict):
+        raise ValueError(f"Expected a dict for {name}")
+    new_upload_paths: dict[str, str] = {}
+    for key, value in upload_paths.items():
+        if value is None:
+            continue
+        if not isinstance(value, dict):
+            raise ValueError(f"Expected a string for {name}[{key}]")
+        if "label" in value:
+            if not isinstance(value["label"], str):
+                raise ValueError(f"Expected a string for '{name}[{key}]['label']")
+            if value["label"] not in label_to_key:
+                raise ValueError(
+                    f"{name}[{key}]['label'] = {value['label']!r} not found"
+                )
+            new_upload_paths[key] = label_to_key[value["label"]]
+        elif "key" in value:
+            if not isinstance(value["key"], str):
+                raise ValueError(f"Expected a string for '{name}[{key}]['key']")
+            new_upload_paths[key] = value["key"]
+        else:
+            raise ValueError(f"Expected either 'label' or 'key' for {name}[{key}]")
+
+    for key, value in new_upload_paths.items():
+        if value not in store:
+            raise KeyError(f"Key {value!r} not found in storage for {name}[{key}]")
+
+    item["upload_paths"] = new_upload_paths
+
+
+class ObjectDictConfig(t.TypedDict, total=False):
+    path: str
+    content: str
+    encoding: str
+    extension: str
+
+
+class FromDictConfig(t.TypedDict, total=False):
+    objects: dict[str, ObjectDictConfig]
+    clients: list[dict[str, t.Any]]
+    codes: list[dict[str, t.Any]]
+    calcjobs: list[dict[str, t.Any]]

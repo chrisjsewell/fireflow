@@ -214,6 +214,8 @@ def main_status(
 ) -> None:
     """Show some basic statistics about the project."""
     storage = ctx.ensure_object(StorageContext).storage
+    console.print("Object Store:")
+    console.print(f"- {_add_plural(storage.objects.count(), 'object')}")
     console.print("Database:")
     console.print(f"- {_add_plural(storage.count_rows(orm.Client), 'client')}")
     console.print(f"- {_add_plural(storage.count_rows(orm.Code), 'code')}")

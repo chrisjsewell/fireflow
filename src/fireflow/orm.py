@@ -40,6 +40,14 @@ if t.TYPE_CHECKING:
 
 
 _BaseType = t.TypeVar("_BaseType", bound="Base")
+_K = t.TypeVar("_K")
+_V = t.TypeVar("_V")
+
+
+class ImmutableDict(immutabledict[_K, _V]):
+    def __repr__(self) -> str:
+        # ise frozen instead of immutabledict
+        return f"frozen({dict.__repr__(self)})"
 
 
 class ImmutableDictType(sa.TypeDecorator[t.Dict[t.Any, t.Any]]):
@@ -67,8 +75,8 @@ class ImmutableDictType(sa.TypeDecorator[t.Dict[t.Any, t.Any]]):
 
     def process_result_value(
         self, value: t.Any, dialect: sa.Dialect
-    ) -> immutabledict[t.Any, t.Any]:
-        return immutabledict(value)
+    ) -> ImmutableDict[t.Any, t.Any]:
+        return ImmutableDict(value)
 
 
 class ImmutableTupleType(sa.TypeDecorator[t.Tuple[t.Any, ...]]):
@@ -238,13 +246,13 @@ class Client(Base):
 
     """The file system type on the remote machine."""
     small_file_size_mb: Mapped[int] = mapped_column(
-        sa.CheckConstraint("small_file_size_mb>0"), default=5
+        sa.CheckConstraint("small_file_size_mb>=0"), default=5
     )
 
     @validates("small_file_size_mb")
     def _validate_small_file_size_mb(self, key: str, value: int) -> int:
         """Validate the small file size."""
-        if not isinstance(value, int) or value <= 0:
+        if not isinstance(value, int) or value < 0:
             raise ValueError(f"{key!r} must be a positive int, got {value}")
         return value
 
@@ -307,8 +315,8 @@ class Code(Base):
 
     label: Mapped[str] = mapped_column(default_factory=lambda: random.choice(NAMES))
 
-    upload_paths: Mapped[immutabledict[str, t.Optional[str]]] = mapped_column(
-        ImmutableDictType(), default_factory=immutabledict
+    upload_paths: Mapped[ImmutableDict[str, t.Optional[str]]] = mapped_column(
+        ImmutableDictType(), default_factory=ImmutableDict
     )
     """Paths to upload to the remote machine: {path: key},
     relative to the work directory.
@@ -346,13 +354,13 @@ class CalcJob(Base):
     uuid: Mapped[UUID] = mapped_column(default_factory=uuid4)
     """The unique identifier, for remote folder creation."""
 
-    parameters: Mapped[immutabledict[str, t.Any]] = mapped_column(
-        ImmutableDictType(), default_factory=immutabledict
+    parameters: Mapped[ImmutableDict[str, t.Any]] = mapped_column(
+        ImmutableDictType(), default_factory=ImmutableDict
     )
     """JSONable data to store on the node."""
 
-    upload_paths: Mapped[immutabledict[str, t.Optional[str]]] = mapped_column(
-        ImmutableDictType(), default_factory=immutabledict
+    upload_paths: Mapped[ImmutableDict[str, t.Optional[str]]] = mapped_column(
+        ImmutableDictType(), default_factory=ImmutableDict
     )
     """Paths to upload to the remote machine: {path: key},
     relative to the work directory.
@@ -441,8 +449,8 @@ class DataNode(Base):
 
     __tablename__ = "data"
 
-    attributes: Mapped[immutabledict[str, t.Any]] = mapped_column(
-        ImmutableDictType(), default_factory=immutabledict
+    attributes: Mapped[ImmutableDict[str, t.Any]] = mapped_column(
+        ImmutableDictType(), default_factory=ImmutableDict
     )
     """JSONable data to store on the node."""
 
