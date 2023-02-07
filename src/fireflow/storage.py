@@ -3,24 +3,26 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-import posixpath
 from sqlite3 import Connection as SQLite3Connection
-from typing import Iterable, Sequence, TypeVar
+from typing import Any, Iterable, Sequence, TypedDict, TypeVar
 
 import sqlalchemy as sa
+from sqlalchemy import event
+from sqlalchemy import orm as sa_orm
 from sqlalchemy.exc import IntegrityError as SaIntegrityError
-import sqlalchemy.orm as orm
+from sqlalchemy.exc import NoResultFound
 
-from ._object_store import FileObjectStore, InMemoryObjectStore, ObjectStore
-from .orm import Base, CalcJob, Client, Code, Processing
+from . import object_store as ostore
+from . import orm
 
 LOGGER = logging.getLogger(__name__)
 
 
-ORM_TYPE = TypeVar("ORM_TYPE", bound=Base)
+ORM_TYPE = TypeVar("ORM_TYPE", bound=orm.Base)
+ANY_TYPE = TypeVar("ANY_TYPE")
 
 
-@sa.event.listens_for(sa.Engine, "connect")
+@event.listens_for(sa.Engine, "connect")
 def _set_sqlite_pragma(dbapi_connection, connection_record) -> None:  # type: ignore
     """Enable foreign key restrictions for SQLite."""
     if isinstance(dbapi_connection, SQLite3Connection):
@@ -37,21 +39,23 @@ class Storage:
     """Persistent storage for the calculations."""
 
     @classmethod
-    def in_memory(cls) -> Storage:
+    def from_memory(cls) -> Storage:
         """Create an in-memory storage."""
         engine = sa.create_engine("sqlite:///:memory:")
-        Base.metadata.create_all(engine)
-        return cls(engine, InMemoryObjectStore())
+        orm.Base.metadata.create_all(engine)
+        return cls(engine, ostore.InMemoryObjectStore())
 
     @classmethod
-    def on_file(cls, path: Path | str, *, init: bool = False) -> Storage:
+    def from_path(cls, path: Path | str, *, init: bool = False) -> Storage:
         """Connect to an on-file storage."""
         path = Path(path)
         object_path = path / "objects"
         db_path = path / "storage.sqlite"
         if not init:
             if not path.is_dir():
-                raise FileNotFoundError(f"Storage path not found (use init): {path}")
+                raise FileNotFoundError(
+                    f"Storage path not found (use `fireflow init`): {path}"
+                )
             if not object_path.is_dir():
                 raise FileNotFoundError(f"Object store path not found: {object_path}")
             if not db_path.is_file():
@@ -59,48 +63,84 @@ class Storage:
         engine = sa.create_engine(f"sqlite:///{db_path}")
         if init:
             object_path.mkdir(parents=True, exist_ok=True)
-            Base.metadata.create_all(engine)
+            orm.Base.metadata.create_all(engine)
         return cls(
             engine,
-            FileObjectStore(object_path),
+            ostore.FileObjectStore(object_path),
         )
 
     def __init__(
         self,
         engine: sa.Engine,
-        object_store: ObjectStore,
+        object_store: ostore.ObjectStore,
     ) -> None:
         """Initialize the storage."""
 
-        self._session = orm.sessionmaker(engine)()
+        self._session = sa_orm.sessionmaker(engine)()
         self._object_store = object_store
 
     @property
-    def objects(self) -> ObjectStore:
+    def objects(self) -> ostore.ObjectStore:
         """Get the object store."""
         return self._object_store
 
-    def _save_to_db(self, obj: Base) -> None:
+    def _save_to_db(self, obj: orm.Base) -> None:
         """Save an ORM object to the database."""
         LOGGER.debug("Saving row %s", obj)
-        self._session.add(obj)
-        try:
-            self._session.commit()
-        except Exception:
-            self._session.rollback()
-            raise
+        # TODO check this is the best way to do this
+        # with, for example `from_dict` I want to commit at the end
+        # but also want to be able to get e.g. the pk of the object
+        # hence, `add`` then `flush`
+        # otherwise, `add` then `commit`, but we also need to ensure we rollback
+        # note sqlachemy always executes queries in a transaction, and doesn't close it
+        # (its automatically closed on commit)
+        if self._session.in_nested_transaction():
+            self._session.add(obj)
+            # without the flush, the pk is not set
+            self._session.flush()
+        elif self._session.in_transaction():
+            # see
+            # https://docs.sqlalchemy.org/en/20/orm/session_basics.html#framing-out-a-begin-commit-rollback-block
+            try:
+                self._session.add(obj)
+                self._session.commit()
+            except Exception:
+                self._session.rollback()
+                raise
+        else:
+            with self._session.begin():
+                self._session.add(obj)
 
-    def save_client(self, client: Client) -> Client:
-        """Add a client."""
-        if client.pk is not None and self._session.get(Client, client.pk) is not None:
-            raise ValueError(f"{client} already saved")
-        self._save_to_db(client)
-        return client
+    def _create_immutable_obj(self, obj: ORM_TYPE) -> ORM_TYPE:
+        """Create an immutable object."""
+        obj._freeze()
+        return obj
 
-    def delete_obj(self, obj: Base) -> None:
-        """Delete a client."""
+    def save_row(self, row: ORM_TYPE) -> ORM_TYPE:
+        """Add a row to a database table."""
+        if row.is_frozen:
+            raise ValueError(f"Cannot save frozen objects: {row}")
+        if row.pk is not None and self.has_row(row.__class__, row.pk):
+            raise ValueError(f"Cannot save object with existing pk: {row}")
+
+        self._save_to_db(row)
+        return self._create_immutable_obj(row)
+
+    def _update_row(self, row: orm.Base) -> None:
+        """Update a column of a row.
+
+        This is a private method,
+        since it should not generally be called by user.
+        """
+        # TODO better way to do this?
+        self._save_to_db(row)
+
+    def delete_row(self, obj: orm.Base) -> None:
+        """Delete a row of a database table."""
+        # TODO allow deleting by pk
         if obj.pk is None:
             raise ValueError(f"{obj} not saved")
+        # TODO should the delete not be in the try/except?
         self._session.delete(obj)
         try:
             self._session.commit()
@@ -113,52 +153,12 @@ class Storage:
             self._session.rollback()
             raise
 
-    def save_code(self, code: Code) -> Code:
-        """Add a code."""
-        if code.pk is not None and self._session.get(Code, code.pk) is not None:
-            raise ValueError(f"{code} already saved")
-        # validate upload paths
-        for path, key in (code.upload_paths or {}).items():
-            if posixpath.isabs(path):
-                raise ValueError(f"Upload path must be relative: {path}")
-            if key is not None and key not in self._object_store:
-                raise ValueError(f"Upload path key not in object store: {key}")
-        self._save_to_db(code)
-        return code
-
-    def save_calcjob(self, calcjob: CalcJob) -> CalcJob:
-        """Add a calcjob."""
-        if (
-            calcjob.pk is not None
-            and self._session.get(CalcJob, calcjob.pk) is not None
-        ):
-            raise ValueError(f"{calcjob} already saved")
-        # validate download paths
-        for path, key in (calcjob.upload or {}).items():
-            if posixpath.isabs(path):
-                raise ValueError(f"Download path must be relative: {path}")
-            if key is not None and key not in self._object_store:
-                raise ValueError(f"Download path key not in object store: {key}")
-        self._save_to_db(calcjob)
-        return calcjob
-
-    def update_processing(self, processing: Processing) -> None:
-        """Update the processing status."""
-        self._save_to_db(processing)
-
-    def get_obj(self, obj_cls: type[ORM_TYPE], pk: int) -> ORM_TYPE:
-        """Get an ORM object by primary key."""
-        obj = self._session.get(obj_cls, pk)
-        if obj is None:
-            raise ValueError(f"{obj_cls.__name__} {pk} not found")
-        return obj
-
-    def count_obj(
+    def count_rows(
         self, obj_cls: type[ORM_TYPE], *, filters: Sequence[sa.ColumnElement[bool]] = ()
     ) -> int:
-        """Count ORM objects of a particular type
+        """Count rows in a database table.
 
-        :param obj_cls: The class of the objects to select
+        :param obj_cls: The class of the table to select
         :param filters: Additional filters to apply (joined with AND)
         """
         selector = sa.select(obj_cls)
@@ -169,7 +169,39 @@ class Storage:
             sa.select(sa.func.count()).select_from(selector.subquery())
         ).scalar_one()
 
-    def iter_obj(
+    def has_row(self, obj_cls: type[ORM_TYPE], pk: int) -> bool:
+        """Check if a row exists in a database table.
+
+        :param obj_cls: The class of the table to select
+        :param pk: The primary key of the row to select
+        """
+        selector = sa.select(obj_cls.pk)
+        selector = selector.where(obj_cls.pk == pk)
+        return self._session.execute(selector).scalar_one_or_none() is not None
+
+    def get_row(self, obj_cls: type[ORM_TYPE], pk: int) -> ORM_TYPE:
+        """Get a row of a database table, represented by an ORM object.
+
+        :param obj_cls: The class of the table to select
+        :param pk: The primary key of the row to select
+        """
+        obj = self._session.get(obj_cls, pk)
+        if obj is None:
+            raise KeyError(f"{obj_cls.__name__}({pk}) not found")
+        return self._create_immutable_obj(obj)
+
+    def get_column(
+        self, column: sa_orm.InstrumentedAttribute[ANY_TYPE], pk: int
+    ) -> ANY_TYPE:
+        """Get a column for a row of a database table, converted to a Python type."""
+        selector = sa.select(column)
+        selector = selector.where(column.class_.pk == pk)
+        try:
+            return self._session.execute(selector).scalar_one()
+        except NoResultFound:
+            raise KeyError(f"{column.class_.__name__}({pk}) not found")
+
+    def iter_rows(
         self,
         obj_cls: type[ORM_TYPE],
         *,
@@ -177,7 +209,7 @@ class Storage:
         page: int = 1,
         filters: Sequence[sa.ColumnElement[bool]] = (),
     ) -> Iterable[ORM_TYPE]:
-        """Iterate over ORM objects of a particular type
+        """Iterate over rows of a database table, represented by ORM objects.
 
         :param obj_cls: The class of the objects to select
         :param page_size: The number of objects to select per page
@@ -191,33 +223,80 @@ class Storage:
         if filters:
             selector = selector.where(sa.and_(*filters))
         for obj in self._session.scalars(selector):
-            yield obj
+            yield self._create_immutable_obj(obj)
 
-    def get_unfinished(self, limit: None | int = None) -> Sequence[Processing]:
-        """Get unfinished calcjobs, that have not previously excepted."""
-        stmt = (
-            sa.select(Processing)
-            .where(Processing.step != "finalised")
-            .where(Processing.exception == None)  # noqa: E711
-        )
-        if limit is not None:
-            stmt = stmt.limit(limit)
-        return self._session.scalars(stmt).all()
+    def save_from_dict(self, data: FromDictConfig) -> dict[str, Any]:
+        """Load data to the store from a dict representation.
 
-    def from_yaml(self, path: str | Path) -> None:
-        """Load from a yaml file."""
-        # TODO this is a bit of a hack, but it's a good way to get started
-        # add schema validation of the file
-        import yaml
+        :return: A dict of data added to the storage
+        """
+        # TODO load as a jinja template, so we can use variables and do loops etc
 
-        with open(path) as handle:
-            data = yaml.safe_load(handle)
+        # basic validation
+        # TODO could use pydantic os something for this
+        if not isinstance(data, dict):
+            raise ValueError("Expected a dict at the top level")
+        for key in ("clients", "codes", "calcjobs"):
+            if key in data:
+                if not isinstance(data[key], list):  # type: ignore[literal-required]
+                    raise ValueError(f"Expected a list for key '{key}'")
+                for idx, item in enumerate(data[key]):  # type: ignore[literal-required]
+                    if not isinstance(item, dict):
+                        raise ValueError(f"Expected a dict for item '{key}[{idx}]'")
 
-        for client_data in data["clients"]:
-            codes = client_data.pop("codes")
-            client = self.save_client(Client(**client_data))
-            for code_data in codes:
-                calcjobs = code_data.pop("calcjobs")
-                code = self.save_code(Code(**code_data, client_pk=client.pk))
-                for calcjob_data in calcjobs:
-                    self.save_calcjob(CalcJob(**calcjob_data, code_pk=code.pk))
+        # add in single transaction? (so we can rollback if there's an error)
+        with self._session.begin_nested():
+
+            added_pks: dict[str, list[int]] = {}
+
+            for client_data in data.get("clients", []):
+                try:
+                    client = orm.Client(**client_data)
+                    self.save_row(client)
+                except Exception as exc:
+                    raise ValueError(f"clients[{idx}] item is invalid: {exc}") from exc
+                added_pks.setdefault("clients", []).append(client.pk)
+
+            for idx, code_data in enumerate(data.get("codes", [])):
+                if "client_label" not in code_data:
+                    raise ValueError(f"codes[{idx}] item has no 'client_label' key")
+                client_label = code_data.pop("client_label")
+                client_pk = self._session.scalar(
+                    sa.select(orm.Client.pk).where(orm.Client.label == client_label)
+                )
+                if client_pk is None:
+                    raise ValueError(
+                        f"codes[{idx}]['client_label'] = {client_label!r} not found"
+                    )
+                try:
+                    code = orm.Code(**code_data, client_pk=client_pk)
+                    self.save_row(code)
+                except Exception as exc:
+                    raise ValueError(f"codes[{idx}] item is invalid: {exc}") from exc
+                added_pks.setdefault("codes", []).append(code.pk)
+
+            for idx, calcjob_data in enumerate(data.get("calcjobs", [])):
+                if "code_label" not in calcjob_data:
+                    raise ValueError(f"calcjobs[{idx}] item has no 'code_label' key")
+                code_label = calcjob_data.pop("code_label")
+                code_pk = self._session.scalar(
+                    sa.select(orm.Code.pk).where(orm.Code.label == code_label)
+                )
+                if code_pk is None:
+                    raise ValueError(
+                        f"calcjobs[{idx}]['code_label'] = {code_label!r} not found"
+                    )
+                try:
+                    calcjob = orm.CalcJob(**calcjob_data, code_pk=code_pk)
+                    self.save_row(calcjob)
+                except Exception as exc:
+                    raise ValueError(f"calcjobs[{idx}] item is invalid: {exc}") from exc
+                added_pks.setdefault("calcjobs", []).append(calcjob.pk)
+
+        return added_pks
+
+
+class FromDictConfig(TypedDict, total=False):
+    clients: list[dict[str, Any]]
+    codes: list[dict[str, Any]]
+    calcjobs: list[dict[str, Any]]

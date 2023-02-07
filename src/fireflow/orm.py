@@ -7,25 +7,126 @@ Client
 
 See also: https://docs.sqlalchemy.org/en/20/orm/quickstart.html
 """
+import dataclasses
 from pathlib import PurePosixPath, PureWindowsPath
+import posixpath
 import random
-from typing import Any, Dict, List, Literal, Optional, Tuple, Union
-from uuid import uuid4
+import typing as t
+from uuid import UUID, uuid4
 
 import firecrest
-from sqlalchemy import JSON, Enum, ForeignKey, String, UniqueConstraint
-from sqlalchemy.ext.mutable import MutableDict, MutableList
+import sqlalchemy as sa
 from sqlalchemy.orm import (
     DeclarativeBase,
     Mapped,
     MappedAsDataclass,
     mapped_column,
     relationship,
+    validates,
 )
+from sqlalchemy.util import immutabledict
 
-# TODO versioning
-# TODO how to make attributes read-only? (https://github.com/sqlalchemy/sqlalchemy/discussions/9192)
-# TODO the init of these classes does not seem to be checked by mypy
+if t.TYPE_CHECKING:
+    from sqlalchemy.sql.operators import OperatorType
+    from sqlalchemy.sql.type_api import TypeEngine
+
+    from .object_store import ObjectStore
+
+
+# TODO versioning of database schema
+# TODO the init of these classes does not seem to be checked by mypy (but shows in pylance)
+# probably ok once https://github.com/python/mypy/pull/14523 released
+# TODO more validation of the data (integrate with pydantic?)
+
+
+_BaseType = t.TypeVar("_BaseType", bound="Base")
+
+
+class ImmutableDictType(sa.TypeDecorator[t.Dict[t.Any, t.Any]]):
+    """A type decorator for immutable dicts.
+
+    Used to ensure that the dict is not modified after it is stored in the database.
+    """
+
+    impl = sa.JSON
+
+    cache_ok = True
+
+    def coerce_compared_value(
+        self, op: t.Optional["OperatorType"], value: t.Any
+    ) -> "TypeEngine[t.Any]":
+        # see: https://docs.sqlalchemy.org/en/20/core/custom_types.html#sqlalchemy.types.TypeDecorator
+        return self.impl.coerce_compared_value(op, value)  # type: ignore
+
+    def process_bind_param(
+        self, value: t.Any, dialect: sa.Dialect
+    ) -> t.Dict[t.Any, t.Any]:
+        if not isinstance(value, dict):
+            raise TypeError(f"Expected dict, got: {type(value)}")
+        return value
+
+    def process_result_value(
+        self, value: t.Any, dialect: sa.Dialect
+    ) -> immutabledict[t.Any, t.Any]:
+        return immutabledict(value)
+
+
+class ImmutableTupleType(sa.TypeDecorator[t.Tuple[t.Any, ...]]):
+    """A type decorator for immutable tuples.
+
+    Used to ensure that the tuple is not modified after it is stored in the database.
+    """
+
+    impl = sa.JSON
+
+    cache_ok = True
+
+    def coerce_compared_value(
+        self, op: t.Optional["OperatorType"], value: t.Any
+    ) -> "TypeEngine[t.Any]":
+        # see: https://docs.sqlalchemy.org/en/20/core/custom_types.html#sqlalchemy.types.TypeDecorator
+        return self.impl.coerce_compared_value(op, value)  # type: ignore
+
+    def process_bind_param(
+        self, value: t.Any, dialect: sa.Dialect
+    ) -> t.Tuple[t.Any, ...]:
+        if isinstance(value, list):
+            value = tuple(value)
+        if not isinstance(value, tuple):
+            raise TypeError(f"Expected list/tuple, got: {type(value)}")
+        return value
+
+    def process_result_value(
+        self, value: t.Any, dialect: sa.Dialect
+    ) -> t.Tuple[t.Any, ...]:
+        return tuple(value)
+
+
+def _validate_virtual_fs(
+    key: str, value: t.Any, ostore: t.Optional["ObjectStore"] = None
+) -> None:
+    """Validate the value is a mapping of Posix path to None or str.
+
+    If `ostore` is not None, also check that the str is a valid object store key.
+    """
+    if not isinstance(value, t.Mapping):
+        raise ValueError(f"{key!r} must be a mapping, got: {value}")
+    for subkey, item in value.items():
+        if not isinstance(subkey, str):
+            raise ValueError(f"{key!r} must have str keys, got: {subkey}")
+        if posixpath.isabs(subkey):
+            raise ValueError(
+                f"{key!r} must have POSIX relative path keys, got: {subkey}"
+            )
+        if item is not None:
+            if not isinstance(item, str):
+                raise ValueError(
+                    f"{key}[{subkey!r}] must be a str or None, got: {item}"
+                )
+            if ostore is not None and item not in ostore:
+                raise KeyError(
+                    f"{key}[{subkey!r}] points to non-existent object key: {item}"
+                )
 
 
 class Base(MappedAsDataclass, DeclarativeBase):
@@ -42,15 +143,74 @@ class Base(MappedAsDataclass, DeclarativeBase):
         """
         return f"{self.__class__.__name__}({self.pk})"
 
-    def __eq__(self, other: Any) -> bool:
-        """Return True if the objects are equal."""
-        if not isinstance(other, self.__class__):
-            return False
-        return self.pk == other.pk
+    def copy(self: _BaseType, **changes: t.Any) -> _BaseType:
+        """Return a copy of the object (with pk set to None and unfrozen).
 
-    def __hash__(self) -> int:
-        """Return the hash of the object."""
-        return hash(self.pk)
+        :param changes: the changes to apply to the copy
+        """
+        return dataclasses.replace(self, **changes)
+
+    # The following is a bespoke implementation an "optional" 'frozen' dataclass,
+    # After storing the object in the database, or if retrieving from the database,
+    # the object should be frozen by default, so users cannot accidentally modify it.
+    # We also want ORM relationships to inherit the frozen state of the parent object.
+    # `_freeze` is called by the `Storage` class to freeze the object after storing/fetching.
+    # TODO not sure if there is a better way than this,
+    # tracked in: https://github.com/sqlalchemy/sqlalchemy/issues/9197
+    # TODO stopping the modification of mutable values like dicts and lists
+    # before I was using sqlalchemy.ext.mutable, to wrap JSON columns,
+    # but this would make the changes be stored in the database, on commit,
+    # which we don't want, so I removed it.
+
+    @t.final
+    @classmethod
+    def field_names(cls) -> t.Set[str]:
+        """Return the names of the fields in the dataclass.
+
+        Cached in the class, for fast access.
+        """
+        try:
+            return cls.__ff_field_names__  # type: ignore
+        except AttributeError:
+            cls.__ff_field_names__ = {f.name for f in dataclasses.fields(cls)}
+            return cls.__ff_field_names__  # type: ignore
+
+    @t.final
+    @property
+    def is_frozen(self) -> bool:
+        """Return True if the object is frozen."""
+        return getattr(self, "__ff_frozen__", False)
+
+    def _freeze(self, state: bool = True) -> None:
+        """Set the frozen state of the instance, and all relationships,
+        to disable modification of its attributes.
+        """
+        self.__ff_frozen__ = state
+
+    def __getattribute__(self, name: str) -> t.Any:
+        """Get the attribute."""
+        obj = super().__getattribute__(name)
+        if name in ("field_names", "__ff_field_names__"):
+            return obj
+        if name in self.field_names() and isinstance(obj, Base):
+            obj.__ff_frozen__ = self.is_frozen
+        return obj
+
+    def __setattr__(self, name: str, value: t.Any) -> None:
+        """Set the attribute."""
+        if self.is_frozen and name in self.field_names():
+            raise dataclasses.FrozenInstanceError(
+                f"cannot set field {name!r} of frozen {self}"
+            )
+        super().__setattr__(name, value)
+
+    def __delattr__(self, name: str) -> None:
+        """Delete the attribute."""
+        if self.is_frozen and name in self.field_names():
+            raise dataclasses.FrozenInstanceError(
+                f"cannot delete field {name!r} of frozen {self}"
+            )
+        super().__delattr__(name)
 
 
 class Client(Base):
@@ -65,12 +225,29 @@ class Client(Base):
     client_secret: Mapped[str]  # TODO should this be stored in the database?
     machine_name: Mapped[str]
     work_dir: Mapped[str]
+
+    @validates("work_dir")
+    def _validate_work_dir(self, key: str, value: str) -> str:
+        """Validate the client URL."""
+        if not (isinstance(value, str) and value.startswith("/")):
+            raise ValueError(f"{key!r} must be an absolute path str, got {value}")
+        return value
+
     """The working directory for the user on the remote machine."""
-    fsystem: Mapped[Literal["posix", "windows"]] = mapped_column(
-        Enum("posix", "windows"), default="posix"
-    )
+    fsystem: Mapped[t.Literal["posix", "windows"]] = mapped_column(default="posix")
+
     """The file system type on the remote machine."""
-    small_file_size_mb: Mapped[int] = mapped_column(default=5)
+    small_file_size_mb: Mapped[int] = mapped_column(
+        sa.CheckConstraint("small_file_size_mb>0"), default=5
+    )
+
+    @validates("small_file_size_mb")
+    def _validate_small_file_size_mb(self, key: str, value: int) -> int:
+        """Validate the small file size."""
+        if not isinstance(value, int) or value <= 0:
+            raise ValueError(f"{key!r} must be a positive int, got {value}")
+        return value
+
     """The maximum size of a file that can be uploaded directly, in MB."""
     label: Mapped[str] = mapped_column(
         unique=True, default_factory=lambda: random.choice(NAMES)
@@ -78,7 +255,7 @@ class Client(Base):
     """A label for the client."""
 
     @property
-    def work_path(self) -> Union[PurePosixPath, PureWindowsPath]:
+    def work_path(self) -> t.Union[PurePosixPath, PureWindowsPath]:
         """Return the work directory path."""
         return (
             PurePosixPath(self.work_dir)
@@ -107,10 +284,11 @@ class Code(Base):
     """Data for a single code."""
 
     __tablename__ = "code"
-    __table_args__ = (UniqueConstraint("client_pk", "label"),)
+    __table_args__ = (sa.UniqueConstraint("client_pk", "label"),)
+
     client_pk: Mapped[int] = mapped_column(
         # don't allow client to be deleted if there are codes associated with it
-        ForeignKey("client.pk", ondelete="RESTRICT")
+        sa.ForeignKey("client.pk", ondelete="RESTRICT")
     )
     """The primary key of the client that this code is associated with."""
     client: Mapped[Client] = relationship(init=False, repr=False)
@@ -129,8 +307,8 @@ class Code(Base):
 
     label: Mapped[str] = mapped_column(default_factory=lambda: random.choice(NAMES))
 
-    upload_paths: Mapped[Dict[str, Optional[str]]] = mapped_column(
-        MutableDict.as_mutable(JSON()), default_factory=dict
+    upload_paths: Mapped[immutabledict[str, t.Optional[str]]] = mapped_column(
+        ImmutableDictType(), default_factory=immutabledict
     )
     """Paths to upload to the remote machine: {path: key},
     relative to the work directory.
@@ -138,6 +316,16 @@ class Code(Base):
     - `path` POSIX formatted.
     - `key` pointing to the file in the object store, or None if a directory.
     """
+
+    @validates("upload_paths")
+    def _validate_upload_paths(self, key: str, value: t.Any) -> t.Any:
+        """Validate the upload paths."""
+        _validate_virtual_fs(key, value)
+        return value
+
+    # TODO allow also for upload paths to be marked as jinja2 templates
+    # like the job script
+    # also Code.upload_paths and Calcjob.upload_paths should be at least the same name
 
 
 class CalcJob(Base):
@@ -147,7 +335,7 @@ class CalcJob(Base):
 
     code_pk: Mapped[int] = mapped_column(
         # don't allow code to be deleted if there are calcjobs associated with it
-        ForeignKey("code.pk", ondelete="RESTRICT")
+        sa.ForeignKey("code.pk", ondelete="RESTRICT")
     )
     """The primary key of the code that this calcjob is associated with."""
     code: Mapped[Code] = relationship(init=False, repr=False)
@@ -155,16 +343,16 @@ class CalcJob(Base):
 
     label: Mapped[str] = mapped_column(default="")
 
-    uuid: Mapped[str] = mapped_column(String(36), default_factory=lambda: str(uuid4()))
+    uuid: Mapped[UUID] = mapped_column(default_factory=uuid4)
     """The unique identifier, for remote folder creation."""
 
-    parameters: Mapped[Dict[str, Any]] = mapped_column(
-        MutableDict.as_mutable(JSON()), default_factory=dict
+    parameters: Mapped[immutabledict[str, t.Any]] = mapped_column(
+        ImmutableDictType(), default_factory=immutabledict
     )
     """JSONable data to store on the node."""
 
-    upload: Mapped[Dict[str, Optional[str]]] = mapped_column(
-        MutableDict.as_mutable(JSON()), default_factory=dict
+    upload_paths: Mapped[immutabledict[str, t.Optional[str]]] = mapped_column(
+        ImmutableDictType(), default_factory=immutabledict
     )
     """Paths to upload to the remote machine: {path: key},
     relative to the work directory.
@@ -173,12 +361,34 @@ class CalcJob(Base):
     - `key` pointing to the file in the object store, or None if a directory.
     """
 
-    download_globs: Mapped[List[str]] = mapped_column(
-        MutableList.as_mutable(JSON()), default_factory=list
+    @validates("upload_paths")
+    def _validate_upload_paths(self, key: str, value: t.Any) -> t.Any:
+        """Validate the upload paths."""
+        _validate_virtual_fs(key, value)
+        return value
+
+    download_globs: Mapped[t.Tuple[str, ...]] = mapped_column(
+        ImmutableTupleType(), default_factory=tuple
     )
     """Globs to download from the remote machine to the object store,
     relative to the work directory.
     """
+
+    @validates("download_globs")
+    def _validate_download_globs(self, key: str, value: t.Any) -> t.Any:
+        """Validate the download globs."""
+        if isinstance(value, list):
+            value = tuple(value)
+        if not (
+            isinstance(value, tuple)
+            and all(
+                isinstance(item, str) and not posixpath.isabs(item) for item in value
+            )
+        ):
+            raise TypeError(
+                f"{key!r} must be a list/tuple of relative POSIX paths, got: {value}"
+            )
+        return value
 
     status: Mapped["Processing"] = relationship(
         single_parent=True,
@@ -189,39 +399,40 @@ class CalcJob(Base):
     """The processing status of the calcjob."""
 
     @property
-    def remote_path(self) -> Union[PurePosixPath, PureWindowsPath]:
+    def remote_path(self) -> t.Union[PurePosixPath, PureWindowsPath]:
         """Return the remote path for the calcjob execution."""
-        return self.code.client.work_path / "workflows" / self.uuid
+        return self.code.client.work_path / "workflows" / self.uuid.hex
 
 
 class Processing(Base):
     """The processing status of a single running calcjob."""
 
     __tablename__ = "calcjob_status"
+    __orm_immutable__ = False
 
-    calcjob_pk: Mapped[int] = mapped_column(ForeignKey("calcjob.pk"), init=False)
+    calcjob_pk: Mapped[int] = mapped_column(sa.ForeignKey("calcjob.pk"), init=False)
     """The primary key of the calculation that this status is associated with."""
     calcjob: Mapped[CalcJob] = relationship(
         back_populates="status", init=False, repr=False
     )
     """The calcjob that this status is associated with."""
 
+    state: Mapped[
+        t.Literal["playing", "paused", "finished", "excepted"]
+    ] = mapped_column(default="playing")
+    """The status of the calcjob."""
+
     step: Mapped[
-        Literal[
+        t.Literal[
             "created", "uploading", "submitting", "running", "retrieving", "finalised"
         ]
-    ] = mapped_column(
-        Enum(
-            "created", "uploading", "submitting", "running", "retrieving", "finalised"
-        ),
-        default="created",
-    )
+    ] = mapped_column(default="created")
     """The step of the calcjob."""
 
-    job_id: Mapped[Optional[str]] = mapped_column(default=None)
+    job_id: Mapped[t.Optional[str]] = mapped_column(default=None)
     """The job id of the calcjob, set by the scheduler."""
 
-    exception: Mapped[Optional[str]] = mapped_column(default=None)
+    exception: Mapped[t.Optional[str]] = mapped_column(default=None)
     """The exception that was raised, if any."""
 
 
@@ -230,24 +441,24 @@ class DataNode(Base):
 
     __tablename__ = "data"
 
-    attributes: Mapped[Dict[str, Any]] = mapped_column(
-        MutableDict.as_mutable(JSON()), default_factory=dict
+    attributes: Mapped[immutabledict[str, t.Any]] = mapped_column(
+        ImmutableDictType(), default_factory=immutabledict
     )
     """JSONable data to store on the node."""
 
-    creator_pk: Mapped[Optional[int]] = mapped_column(
+    creator_pk: Mapped[t.Optional[int]] = mapped_column(
         # don't allow calcjob to be deleted if there are data associated with it
-        ForeignKey("calcjob.pk", ondelete="RESTRICT"),
+        sa.ForeignKey("calcjob.pk", ondelete="RESTRICT"),
         default=None,
     )
     """The primary key of the calcjob that created this node."""
-    creator: Mapped[Optional[CalcJob]] = relationship(
+    creator: Mapped[t.Optional[CalcJob]] = relationship(
         init=False, repr=False, default=None
     )
     """The calcjob that created this node."""
 
 
-NAMES: Tuple[str, ...] = (
+NAMES: t.Tuple[str, ...] = (
     "digital_dynamo",
     "futuristic_fusion",
     "optical_odyssey",

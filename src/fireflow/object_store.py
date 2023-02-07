@@ -23,7 +23,10 @@ class BinaryStream(Protocol):
 class ObjectStore(ABC):
     """A simple object store.
 
-    Files are stored via there SHA256 hash.
+    Files are stored via their SHA256 hash, to avoid duplicates.
+    Files are also stored with an optional extension,
+    to provide a simple way to record their encoding.
+    Two files with the same hash but different extensions are not allowed.
     """
 
     @abstractmethod
@@ -133,42 +136,82 @@ class FileObjectStore(ObjectStore):
 
     def add_from_bytes(self, obj: bytes, ext: str = "") -> str:
         sha256 = hashlib.sha256(obj).hexdigest()
-        if sha256 in self and self.extension(sha256) != ext:
-            raise ValueError(
-                f"Object already in store with different extension: {sha256}"
-            )
-        path = self._path / f"{sha256}.{ext}"
-        path.write_bytes(obj)
+
+        try:
+            stored_ext = self.extension(sha256)
+        except KeyError:
+            pass
+        else:
+            if stored_ext != ext:
+                raise ValueError(
+                    f"Object already in store with extension {stored_ext}: {sha256}"
+                )
+            return sha256
+
+        path = self._path / sha256 / f"file.{ext}"
+        path.parent.mkdir(exist_ok=True)
+        try:
+            path.write_bytes(obj)
+        except Exception:
+            if path.exists():
+                path.unlink()
+            raise
         return sha256
 
     def add_from_io(
         self, obj: BinaryStream, *, ext: str = "", chunks: int = COPY_BUFSIZE
     ) -> str:
+        """Add an object to the store idempotently and atomically.
+
+        To be atomic, the object is first written to a temporary file,
+        whilst computing its hash.
+        If the object is already in the store, the temporary file is deleted.
+        If the object is not in the store, the temporary file is moved to the store.
+        """
         hasher = hashlib.sha256()
-        with tempfile.TemporaryFile("wb") as temp:
+        with tempfile.NamedTemporaryFile("wb", delete=False) as temp:
             while True:
                 chunk = obj.read(chunks)
                 if not chunk:
                     break
                 hasher.update(chunk)
                 temp.write(chunk)
-            sha256 = hasher.hexdigest()
-            if sha256 in self:
-                if self.extension(sha256) != ext:
-                    raise ValueError(
-                        f"Object already in store with different extension: {sha256}"
-                    )
-                return sha256
-            temp.seek(0)
-            with open(self._path / f"{sha256}.{ext}") as handle:
-                shutil.copyfileobj(temp, handle)  # type: ignore
 
+        sha256 = hasher.hexdigest()
+
+        try:
+            stored_ext = self.extension(sha256)
+        except KeyError:
+            pass
+        else:
+            Path(temp.name).unlink()
+            if stored_ext != ext:
+                raise ValueError(
+                    f"Object already in store with extension {stored_ext}: {sha256}"
+                )
+            return sha256
+
+        path = self._path / sha256 / f"file.{ext}"
+        path.parent.mkdir(exist_ok=True)
+        try:
+            shutil.move(temp.name, path)
+        except Exception:
+            if path.exists():
+                path.unlink()
+            raise
         return sha256
 
     def _get_path(self, sha256: str) -> Path:
-        for path in self._path.glob(f"{sha256}.*"):
+        folder = self._path / sha256
+        if not folder.exists():
+            raise KeyError(sha256)
+        for path in folder.glob("file.*"):
             return path
         raise KeyError(sha256)
+
+    def extension(self, sha256: str) -> str:
+        path = self._get_path(sha256)
+        return path.name.split(".", 1)[-1]
 
     def __contains__(self, sha256: str) -> bool:
         try:
@@ -176,10 +219,6 @@ class FileObjectStore(ObjectStore):
         except KeyError:
             return False
         return True
-
-    def extension(self, sha256: str) -> str:
-        path = self._get_path(sha256)
-        return path.name.split(".", 1)[-1]
 
     def open(self, sha256: str) -> BinaryIO:
         path = self._get_path(sha256)
