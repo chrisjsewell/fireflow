@@ -18,6 +18,7 @@ from jinja2.environment import Template
 from virtual_glob import glob as vglob
 
 from fireflow._remote_path import RemotePath
+from fireflow.object_store import ObjectStore
 from fireflow.orm import CalcJob, Processing
 from fireflow.storage import Storage
 
@@ -79,25 +80,29 @@ async def run_calcjob(process: Processing, storage: Storage) -> None:
 
 async def run_step(process: Processing, storage: Storage) -> None:
     """Run a single step of a calcjob."""
-
-    # TODO would like to move this to pattern matching, but ruff does not support it:
-    # https://github.com/charliermarsh/ruff/issues/282
-
     calc = process.calcjob
+
+    # note all tasks are standardised to use the same interface
+    # (even though some do not need the object store)
+
+    # TODO maybe also take in global settings object
+    # TODO should they take in the calcjob and the process?
+    # we want to clearly delineate what is immutable (i.e. the calcjob),
+    # and what is mutable (i.e. the process)
 
     if process.step == "created":
         process.step = "uploading"
     if process.step == "uploading":
-        await copy_to_remote(calc, storage)
+        await copy_to_remote(calc, storage.objects)
         process.step = "submitting"
     elif process.step == "submitting":
-        await submit_on_remote(calc)
+        await submit_on_remote(calc, storage.objects)
         process.step = "running"
     elif process.step == "running":
-        await poll_until_finished(calc)
+        await poll_until_finished(calc, storage.objects)
         process.step = "retrieving"
     elif process.step == "retrieving":
-        await copy_from_remote(calc, storage)
+        await copy_from_remote(calc, storage.objects)
         process.step = "finalised"
     else:
         raise ValueError(f"Unknown step name {process.step}")
@@ -114,7 +119,7 @@ async def poll_object_transfer(
         await asyncio.sleep(interval)
 
 
-async def copy_to_remote(calc: CalcJob, storage: Storage) -> None:
+async def copy_to_remote(calc: CalcJob, ostore: ObjectStore) -> None:
     """Copy the calculation inputs to the compute resource."""
     # TODO could use checksums, to confirm upload,
     # see also: https://github.com/eth-cscs/pyfirecrest/issues/14
@@ -150,9 +155,9 @@ async def copy_to_remote(calc: CalcJob, storage: Storage) -> None:
         else:
             if remote_path.parent != remote_folder:
                 client.mkdir(client_row.machine_name, str(remote_path.parent), p=True)
-            file_size = storage.objects.get_size(key)
+            file_size = ostore.get_size(key)
             if file_size <= client_row.small_file_size_mb * 1024 * 1024:
-                with storage.objects.open(key) as obj:
+                with ostore.open(key) as obj:
                     # TODO big uqwploads
                     client.simple_upload(
                         client_row.machine_name,
@@ -176,12 +181,12 @@ async def copy_to_remote(calc: CalcJob, storage: Storage) -> None:
                 if os.environ.get("FIRECREST_LOCAL_TESTING"):
                     # TODO this local fix for MACs was necessary for the demo
                     params["url"] = params["url"].replace("192.168.220.19", "localhost")
-                with storage.objects.open(key) as handle:
+                with ostore.open(key) as handle:
                     await upload_io_to_url(handle, remote_path.name, params)
                 await poll_object_transfer(up_obj)
 
 
-async def submit_on_remote(calc: CalcJob) -> None:
+async def submit_on_remote(calc: CalcJob, ostore: ObjectStore) -> None:
     """Run the calcjob on the compute resource."""
     client_row = calc.code.client
     script_path = calc.remote_path / JOB_NAME
@@ -192,7 +197,7 @@ async def submit_on_remote(calc: CalcJob) -> None:
 
 
 async def poll_until_finished(
-    calc: CalcJob, interval: int = 1, timeout: int | None = None
+    calc: CalcJob, ostore: ObjectStore, *, interval: int = 1, timeout: int | None = None
 ) -> None:
     """Poll the compute resource until the calcjob is finished."""
     report(calc.pk, "polling job until finished")
@@ -208,7 +213,7 @@ async def poll_until_finished(
         raise RuntimeError("timeout waiting for calcjob to finish")
 
 
-async def copy_from_remote(calc: CalcJob, storage: Storage) -> None:
+async def copy_from_remote(calc: CalcJob, ostore: ObjectStore) -> None:
     """Copy the calcjob outputs from the compute resource."""
     client_row = calc.code.client
     remote_folder = calc.remote_path
@@ -228,7 +233,7 @@ async def copy_from_remote(calc: CalcJob, storage: Storage) -> None:
                 paths[save_path] = None
             elif vsubpath.is_file():
                 checksum = client.checksum(client_row.machine_name, vsubpath.path)
-                if checksum in storage.objects:
+                if checksum in ostore:
                     paths[save_path] = checksum
                 elif (
                     vsubpath.size is not None
@@ -236,7 +241,7 @@ async def copy_from_remote(calc: CalcJob, storage: Storage) -> None:
                 ):
                     io = BytesIO()
                     client.simple_download(client_row.machine_name, vsubpath.path, io)
-                    key = storage.objects.add_from_bytes(io.getvalue())
+                    key = ostore.add_from_bytes(io.getvalue())
                     if key != checksum:
                         raise RuntimeError(
                             f"checksum mismatch for downloaded file: {vsubpath}"
