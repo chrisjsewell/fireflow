@@ -236,9 +236,7 @@ async def copy_from_remote(calc: CalcJob, storage: Storage) -> None:
                 ):
                     io = BytesIO()
                     client.simple_download(client_row.machine_name, vsubpath.path, io)
-                    key = storage.objects.add_from_bytes(
-                        io.getvalue(), vsubpath.pure_path.suffix.lstrip(".")
-                    )
+                    key = storage.objects.add_from_bytes(io.getvalue())
                     if key != checksum:
                         raise RuntimeError(
                             f"checksum mismatch for downloaded file: {vsubpath}"

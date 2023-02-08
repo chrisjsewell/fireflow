@@ -262,9 +262,8 @@ class Storage:
                 if not isinstance(obj_content["content"], str):
                     raise ValueError(f"Expected a string for object '{obj_label}'")
                 encoding = obj_content.get("encoding", "utf8")
-                extension = obj_content.get("extension", "txt")
                 obj_label_to_key[obj_label] = self.objects.add_from_bytes(
-                    obj_content["content"].encode(encoding), ext=extension
+                    obj_content["content"].encode(encoding)
                 )
             elif "path" in obj_content:
                 if not isinstance(obj_content["path"], str):
@@ -379,7 +378,6 @@ class ObjectDictConfig(t.TypedDict, total=False):
     path: str
     content: str
     encoding: str
-    extension: str
 
 
 class FromDictConfig(t.TypedDict, total=False):
