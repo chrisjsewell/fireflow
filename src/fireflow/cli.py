@@ -6,6 +6,7 @@ import typing as t
 
 from rich import box
 from rich.console import Console
+from rich.syntax import Syntax
 from rich.table import Table
 from rich.tree import Tree
 import typer
@@ -502,11 +503,18 @@ def calcjob_show(
     ctx: typer.Context,
     pk: int = typer.Argument(..., help="Primary key of the calcjob to show"),
     no_process: bool = typer.Option(False, help="Don't show the process"),
+    script: bool = typer.Option(False, help="Show the rendered job script"),
 ) -> None:
     """Show a calcjob."""
     storage = ctx.ensure_object(StorageContext).storage
     calcjob = storage.get_row(orm.CalcJob, pk)
     console.print(calcjob)
+    if script:
+        console.print()
+        console.print("[underline]Job script:[/underline]")
+        highlighted = Syntax(calcjob.create_job_script(), "bash")
+        console.print(highlighted)
+        console.print()
     if not no_process:
         console.print(calcjob.process)
 

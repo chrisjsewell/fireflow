@@ -15,9 +15,10 @@ import typing as t
 from uuid import UUID, uuid4
 
 import firecrest
+from jinja2.environment import Template
 import sqlalchemy as sa
 
-# # see https://docs.sqlalchemy.org/en/20/orm/extensions/associationproxy.html#module-sqlalchemy.ext.associationproxy
+# see https://docs.sqlalchemy.org/en/20/orm/extensions/associationproxy.html#module-sqlalchemy.ext.associationproxy
 from sqlalchemy.ext.associationproxy import AssociationProxy, association_proxy
 from sqlalchemy.orm import (
     DeclarativeBase,
@@ -424,6 +425,13 @@ class CalcJob(Base):
     def remote_path(self) -> t.Union[PurePosixPath, PureWindowsPath]:
         """Return the remote path for the calcjob execution."""
         return self.code.client.work_path / "workflows" / self.uuid.hex
+
+    def create_job_script(self) -> str:
+        """Create the job script from the template."""
+        # TODO check this can be generated without errors, before saving
+        return Template(self.code.script).render(
+            calc=self, code=self.code, client=self.code.client
+        )
 
 
 class Processing(Base):

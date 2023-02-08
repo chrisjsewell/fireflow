@@ -14,7 +14,6 @@ from typing import Any, BinaryIO, Sequence, TypedDict
 import aiofiles
 import aiohttp
 import firecrest
-from jinja2.environment import Template
 from virtual_glob import glob as vglob
 
 from fireflow._remote_path import RemotePath
@@ -132,11 +131,7 @@ async def copy_to_remote(calc: CalcJob, ostore: ObjectStore) -> None:
     client.mkdir(client_row.machine_name, str(remote_folder), p=True)
 
     # create and upload the script file
-    job_script: bytes = (
-        Template(calc.code.script)
-        .render(calc=calc, code=calc.code, client=calc.code.client)
-        .encode("utf-8")
-    )
+    job_script = calc.create_job_script().encode("utf-8")
     client.simple_upload(
         client_row.machine_name,
         BytesIO(job_script),
