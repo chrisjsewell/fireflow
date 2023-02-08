@@ -41,7 +41,7 @@ def run_unfinished_calcjobs(storage: Storage, limit: None | int = None) -> None:
         storage.iter_rows(
             Processing,
             page_size=limit,
-            filters=[Processing.state == "playing"],
+            where=[Processing.state == "playing"],
         )
     )
     asyncio.run(run_multiple_calcjobs(running, storage))
@@ -191,7 +191,7 @@ async def submit_on_remote(calc: CalcJob) -> None:
     report(calc.pk, "submitting on remote")
     client = client_row.client
     result = client.submit(client_row.machine_name, str(script_path), local_file=False)
-    calc.status.job_id = result["jobid"]
+    calc.process.job_id = result["jobid"]
 
 
 async def poll_until_finished(
@@ -203,7 +203,7 @@ async def poll_until_finished(
     client = client_row.client
     start = time.time()
     while timeout is None or (time.time() - start) < timeout:
-        results = client.poll(client_row.machine_name, [calc.status.job_id])
+        results = client.poll(client_row.machine_name, [calc.process.job_id])
         if results and results[0]["state"] == "COMPLETED":
             break
         await asyncio.sleep(interval)

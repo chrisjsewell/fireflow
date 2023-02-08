@@ -13,6 +13,7 @@ from typer.core import TyperGroup
 import yaml
 
 from fireflow import __version__, orm
+from fireflow._sql_parse import filter_from_string
 from fireflow.process import REPORT_LEVEL, run_unfinished_calcjobs
 from fireflow.storage import Storage
 
@@ -63,6 +64,9 @@ app_main.add_typer(
 
 # TODO how to order typers in help panel? (currently alphabetical)
 # TODO handle exceptions better, only showing traceback if --debug is set
+# TODO doctor command (purge object store of objects not referenced in database)
+# TODO move run into a seperate panel
+# TODO list calcjobs, and allow changing state
 
 
 def version_callback(value: bool) -> None:
@@ -73,15 +77,29 @@ def version_callback(value: bool) -> None:
 
 
 def create_table(
-    table_title: str, data: t.Iterable[t.Dict[str, t.Any]], *mappings: t.Tuple[str, str]
+    table_title: str,
+    data: t.Iterable[t.Dict[str, t.Any]],
+    *,
+    keys: t.Optional[t.List[str]] = None,
+    aliases: t.Optional[t.Dict[str, str]] = None,
 ) -> Table:
-    """Create a table to print"""
-    table = Table(title=table_title, box=box.ROUNDED)
-    for (title, _) in mappings:
-        table.add_column(title, overflow="fold")
+    """Create a table to print
 
-    for i in data:
-        table.add_row(*(str(i[key]) for (_, key) in mappings))
+    :param table_title: The title of the table
+    :param data: A list of objects to print
+    :param keys: A list of keys to print, in order,
+        otherwise take from the first object
+    :param aliases: A dictionary mapping the keys to the column titles
+    """
+    aliases = aliases or {}
+    table = Table(title=table_title, box=box.ROUNDED)
+    for i, obj in enumerate(data):
+        if i == 0:
+            if keys is None:
+                keys = list(obj)
+            for key in keys:
+                table.add_column(aliases.get(key, key), overflow="fold")
+        table.add_row(*(str(obj[key]) for key in (keys or [])))
 
     return table
 
@@ -227,7 +245,7 @@ def main_status(
         ("excepted", "red"),
     ]:
         filter_ = [orm.Processing.state == status]
-        count = storage.count_rows(orm.Processing, filters=filter_)
+        count = storage.count_rows(orm.Processing, where=filter_)
         if count > 0:
             console.print(f"  - {count} [{color}]{status}[/{color}]")
 
@@ -344,29 +362,36 @@ def client_list(
     ctx: typer.Context,
     page: int = typer.Option(1, help="The page of results to show"),
     page_size: int = typer.Option(100, help="The number of results per page"),
+    where: t.Optional[str] = typer.Option(
+        None, "--where", "-w", help="SQL WHERE clause, e.g. 'pk>1'"
+    ),
+    debug: bool = typer.Option(False, help="Show more information for debugging"),
 ) -> None:
     """List Clients."""
     storage = ctx.ensure_object(StorageContext).storage
-    count = storage.count_rows(orm.Client)
+    where_clause = None if where is None else filter_from_string(orm.Client, where)
+    if debug and where_clause is not None:
+        console.print(f"[blue]WHERE clause: {where_clause}[/blue]")
+    count = storage.count_rows(orm.Client, where=where_clause)
+    if not count:
+        console.print("[green]No Clients to list[/green]")
+        return
     table = create_table(
         "Clients {}-{} of {}".format(
             (page - 1) * page_size + 1, min(page * page_size, count), count
         ),
         (
             {
-                "pk": client.pk,
-                "label": client.label,
-                "client_url": client.client_url,
-                "client_id": client.client_id,
-                "machine_name": client.machine_name,
+                "PK": client.pk,
+                "Label": client.label,
+                "Client URL": client.client_url,
+                "Client ID": client.client_id,
+                "Machine": client.machine_name,
             }
-            for client in storage.iter_rows(orm.Client, page=page, page_size=page_size)
+            for client in storage.iter_rows(
+                orm.Client, page=page, page_size=page_size, where=where_clause
+            )
         ),
-        ("PK", "pk"),
-        ("Label", "label"),
-        ("Client URL", "client_url"),
-        ("Client ID", "client_id"),
-        ("Machine", "machine_name"),
     )
     console.print(table)
 
@@ -403,10 +428,20 @@ def code_tree(
     ctx: typer.Context,
     page: int = typer.Option(1, help="The page of results to show"),
     page_size: int = typer.Option(100, help="The number of results per page"),
+    where: t.Optional[str] = typer.Option(
+        None, "--where", "-w", help="SQL WHERE clause, e.g. 'pk>1'"
+    ),
+    debug: bool = typer.Option(False, help="Show more information for debugging"),
 ) -> None:
     """Tree of Client :left_arrow_curving_right: Code."""
     storage = ctx.ensure_object(StorageContext).storage
-    count = storage.count_rows(orm.Code)
+    where_clause = None if where is None else filter_from_string(orm.Code, where)
+    if debug and where_clause is not None:
+        console.print(f"[blue]WHERE clause: {where_clause}[/blue]")
+    count = storage.count_rows(orm.Code, where=where_clause)
+    if not count:
+        console.print("[green]No Codes to list[/green]")
+        return
     tree = Tree(
         "[bold]Codes[/bold] {}-{} of {}".format(
             (page - 1) * page_size + 1, min(page * page_size, count), count
@@ -414,7 +449,9 @@ def code_tree(
         highlight=False,
     )
     client_nodes: t.Dict[int, Tree] = {}
-    for code in storage.iter_rows(orm.Code, page=page, page_size=page_size):
+    for code in storage.iter_rows(
+        orm.Code, page=page, page_size=page_size, where=where_clause
+    ):
         if code.client.pk not in client_nodes:
             client_nodes[code.client.pk] = tree.add(
                 f"[blue]{code.client.pk}[/blue] - {code.client.label}"
@@ -428,27 +465,34 @@ def code_list(
     ctx: typer.Context,
     page: int = typer.Option(1, help="The page of results to show"),
     page_size: int = typer.Option(100, help="The number of results per page"),
+    where: t.Optional[str] = typer.Option(
+        None, "--where", "-w", help="SQL WHERE clause, e.g. 'pk>1'"
+    ),
+    debug: bool = typer.Option(False, help="Show more information for debugging"),
 ) -> None:
     """List Codes."""
     storage = ctx.ensure_object(StorageContext).storage
-    count = storage.count_rows(orm.Code)
+    where_clause = None if where is None else filter_from_string(orm.Code, where)
+    if debug and where_clause is not None:
+        console.print(f"[blue]WHERE clause: {where_clause}[/blue]")
+    count = storage.count_rows(orm.Code, where=where_clause)
+    if not count:
+        console.print("[green]No Codes to list[/green]")
+        return
     table = create_table(
         "Codes {}-{} of {}".format(
             (page - 1) * page_size + 1, min(page * page_size, count), count
         ),
         (
             {
-                "pk": code.pk,
-                "label": code.label,
-                "client_pk": code.client_pk,
-                "client_label": code.client.label,
+                "PK": code.pk,
+                "Label": code.label,
+                "Client": f"{code.client_pk} ({code.client.label})",
             }
-            for code in storage.iter_rows(orm.Code, page=page, page_size=page_size)
+            for code in storage.iter_rows(
+                orm.Code, page=page, page_size=page_size, where=where_clause
+            )
         ),
-        ("PK", "pk"),
-        ("Label", "label"),
-        ("Client PK", "client_pk"),
-        ("Client Label", "client_label"),
     )
     console.print(table)
 
@@ -457,12 +501,16 @@ def code_list(
 def calcjob_show(
     ctx: typer.Context,
     pk: int = typer.Argument(..., help="Primary key of the calcjob to show"),
+    process: bool = typer.Option(
+        False, "--process", "-p", help="Show the process as well"
+    ),
 ) -> None:
     """Show a calcjob."""
     storage = ctx.ensure_object(StorageContext).storage
     calcjob = storage.get_row(orm.CalcJob, pk)
     console.print(calcjob)
-    console.print(calcjob.status)
+    if process:
+        console.print(calcjob.process)
 
 
 @app_calcjob.command("delete")
@@ -478,6 +526,47 @@ def calcjob_delete(
     console.print(f"[green]Deleted CalcJob {pk}[/green]")
 
 
+@app_calcjob.command("list")
+def calcjob_list(
+    ctx: typer.Context,
+    page: int = typer.Option(1, help="The page of results to show"),
+    page_size: int = typer.Option(100, help="The number of results per page"),
+    where: t.Optional[str] = typer.Option(
+        None, "--where", "-w", help="SQL WHERE clause, e.g. 'pk>1'"
+    ),
+    debug: bool = typer.Option(False, help="Show more information for debugging"),
+) -> None:
+    """List Codes."""
+    storage = ctx.ensure_object(StorageContext).storage
+    where_clause = None if where is None else filter_from_string(orm.CalcJob, where)
+    if debug and where_clause is not None:
+        console.print(f"[blue]WHERE clause: {where_clause}[/blue]")
+    count = storage.count_rows(orm.CalcJob, where=where_clause)
+    if not count:
+        console.print("[green]No CalcJob to list[/green]")
+        return
+    table = create_table(
+        "CalcJob {}-{} of {}".format(
+            (page - 1) * page_size + 1, min(page * page_size, count), count
+        ),
+        (
+            {
+                "PK": calc.pk,
+                # "UUID": str(calc.uuid),
+                "Label": calc.label,
+                "Code": f"{calc.code_pk} ({calc.code.label})",
+                "Client": f"{calc.code.client_pk} ({calc.code.client.label})",
+                "State": calc.state,
+                "Step": calc.process.step,
+            }
+            for calc in storage.iter_rows(
+                orm.CalcJob, page=page, page_size=page_size, where=where_clause
+            )
+        ),
+    )
+    console.print(table)
+
+
 _STATE_EMOJI = {
     "playing": ":arrow_forward:",
     "paused": ":pause_button:",
@@ -491,10 +580,20 @@ def calcjob_tree(
     ctx: typer.Context,
     page: int = typer.Option(1, help="The page of results to show"),
     page_size: int = typer.Option(100, help="The number of results per page"),
+    where: t.Optional[str] = typer.Option(
+        None, "--where", "-w", help="SQL WHERE clause, e.g. 'pk>1'"
+    ),
+    debug: bool = typer.Option(False, help="Show more information for debugging"),
 ) -> None:
     """Tree of Client :left_arrow_curving_right: Code :left_arrow_curving_right: CalcJob."""
     storage = ctx.ensure_object(StorageContext).storage
-    count = storage.count_rows(orm.CalcJob)
+    where_clause = None if where is None else filter_from_string(orm.CalcJob, where)
+    if debug and where_clause is not None:
+        console.print(f"[blue]WHERE clause: {where_clause}[/blue]")
+    count = storage.count_rows(orm.CalcJob, where=where_clause)
+    if not count:
+        console.print("[green]No CalcJob to list[/green]")
+        return
     tree = Tree(
         "[bold]Calcjobs[/bold] {}-{} of {}".format(
             (page - 1) * page_size + 1, min(page * page_size, count), count
@@ -503,7 +602,9 @@ def calcjob_tree(
     )
     client_nodes: t.Dict[int, Tree] = {}
     code_nodes: t.Dict[int, Tree] = {}
-    for calcjob in storage.iter_rows(orm.CalcJob, page=page, page_size=page_size):
+    for calcjob in storage.iter_rows(
+        orm.CalcJob, page=page, page_size=page_size, where=where_clause
+    ):
         if calcjob.code.client.pk not in client_nodes:
             client_nodes[calcjob.code.client.pk] = tree.add(
                 f"[blue]{calcjob.code.client.pk}[/blue] - {calcjob.code.client.label}"
@@ -513,7 +614,7 @@ def calcjob_tree(
                 f"[blue]{calcjob.code.pk}[/blue] - {calcjob.code.label}"
             )
         code_nodes[calcjob.code.pk].add(
-            f"[blue]{calcjob.pk}[/blue] - {calcjob.label} {_STATE_EMOJI[calcjob.status.state]}"
+            f"[blue]{calcjob.pk}[/blue] - {calcjob.label} {_STATE_EMOJI[calcjob.state]}"
         )
 
     console.print(tree)

@@ -24,7 +24,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-cli = ["typer[all]~=0.7.0"]
+cli = ["typer[all]~=0.7.0", "pyparsing"]
 testing = ["pytest"]
 
 [project.scripts]
@@ -44,6 +44,7 @@ extend-select = ["B0", "C4", "ICN", "ISC", "N", "RUF", "SIM", "T20"]
 [tool.ruff.per-file-ignores]
 # ignore: Do not perform function call `typer.Option` in argument defaults
 "src/fireflow/cli.py" = ["B008"]
+"src/fireflow/_sql_parse.py" = ["N806"]
 
 [tool.mypy]
 show_error_codes = true

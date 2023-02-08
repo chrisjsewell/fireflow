@@ -16,6 +16,9 @@ from uuid import UUID, uuid4
 
 import firecrest
 import sqlalchemy as sa
+
+# # see https://docs.sqlalchemy.org/en/20/orm/extensions/associationproxy.html#module-sqlalchemy.ext.associationproxy
+from sqlalchemy.ext.associationproxy import AssociationProxy, association_proxy
 from sqlalchemy.orm import (
     DeclarativeBase,
     Mapped,
@@ -37,6 +40,7 @@ if t.TYPE_CHECKING:
 # TODO the init of these classes does not seem to be checked by mypy (but shows in pylance)
 # probably ok once https://github.com/python/mypy/pull/14523 released
 # TODO more validation of the data (integrate with pydantic?)
+# TODO validation of the object keys (i.e. they are in the object store)
 
 
 _BaseType = t.TypeVar("_BaseType", bound="Base")
@@ -336,6 +340,9 @@ class Code(Base):
     # also Code.upload_paths and Calcjob.upload_paths should be at least the same name
 
 
+ProcessStates = t.Literal["playing", "paused", "finished", "excepted"]
+
+
 class CalcJob(Base):
     """Input data for a single calculation job."""
 
@@ -398,13 +405,17 @@ class CalcJob(Base):
             )
         return value
 
-    status: Mapped["Processing"] = relationship(
+    process: Mapped["Processing"] = relationship(
         single_parent=True,
         cascade="all, delete-orphan",
         default_factory=lambda: Processing(),
         repr=False,
     )
-    """The processing status of the calcjob."""
+
+    state: AssociationProxy[ProcessStates] = association_proxy(
+        "process", "state", init=False
+    )
+    """The processing state of the calcjob."""
 
     @property
     def remote_path(self) -> t.Union[PurePosixPath, PureWindowsPath]:
@@ -413,7 +424,11 @@ class CalcJob(Base):
 
 
 class Processing(Base):
-    """The processing status of a single running calcjob."""
+    """The processing data of a single running calcjob.
+
+    We use a separate table for this, to make a clear separation between
+    mutable and immutable data.
+    """
 
     __tablename__ = "calcjob_status"
     __orm_immutable__ = False
@@ -421,14 +436,12 @@ class Processing(Base):
     calcjob_pk: Mapped[int] = mapped_column(sa.ForeignKey("calcjob.pk"), init=False)
     """The primary key of the calculation that this status is associated with."""
     calcjob: Mapped[CalcJob] = relationship(
-        back_populates="status", init=False, repr=False
+        back_populates="process", init=False, repr=False
     )
     """The calcjob that this status is associated with."""
 
-    state: Mapped[
-        t.Literal["playing", "paused", "finished", "excepted"]
-    ] = mapped_column(default="playing")
-    """The status of the calcjob."""
+    state: Mapped[ProcessStates] = mapped_column(default="playing")
+    """The state of the calcjob."""
 
     step: Mapped[
         t.Literal[

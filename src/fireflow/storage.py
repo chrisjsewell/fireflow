@@ -157,18 +157,20 @@ class Storage:
         self,
         obj_cls: type[ORM_TYPE],
         *,
-        filters: t.Sequence[sa.ColumnElement[bool]] = (),
+        where: None
+        | sa.ColumnElement[bool]
+        | t.Sequence[sa.ColumnElement[bool]] = None,
     ) -> int:
         """Count rows in a database table.
 
         :param obj_cls: The class of the table to select
-        :param filters: Additional filters to apply (joined with AND)
+        :param where: Additional filters to apply (sequence joined with AND)
         """
         selector = sa.select(obj_cls)
         selector = selector.order_by(obj_cls.pk)
-        if filters:
-            selector = selector.where(sa.and_(*filters))
-        return self._session.execute(  # type: ignore
+        if where is not None:
+            selector = selector.where(_create_filter(where))
+        return self._session.execute(
             sa.select(sa.func.count()).select_from(selector.subquery())
         ).scalar_one()
 
@@ -210,21 +212,23 @@ class Storage:
         *,
         page_size: int | None = None,
         page: int = 1,
-        filters: t.Sequence[sa.ColumnElement[bool]] = (),
+        where: None
+        | sa.ColumnElement[bool]
+        | t.Sequence[sa.ColumnElement[bool]] = None,
     ) -> t.Iterable[ORM_TYPE]:
         """Iterate over rows of a database table, represented by ORM objects.
 
         :param obj_cls: The class of the objects to select
         :param page_size: The number of objects to select per page
         :param page_number: The page number to select
-        :param filters: Additional filters to apply (joined with AND)
+        :param where: Additional filters to apply (sequence joined with AND)
         """
         selector = sa.select(obj_cls)
         selector = selector.order_by(obj_cls.pk)
         if page_size is not None:
             selector = selector.limit(page_size).offset((page - 1) * page_size)
-        if filters:
-            selector = selector.where(sa.and_(*filters))
+        if where is not None:
+            selector = selector.where(_create_filter(where))
         for obj in self._session.scalars(selector):
             yield self._create_immutable_obj(obj)
 
@@ -383,3 +387,16 @@ class FromDictConfig(t.TypedDict, total=False):
     clients: list[dict[str, t.Any]]
     codes: list[dict[str, t.Any]]
     calcjobs: list[dict[str, t.Any]]
+
+
+def _create_filter(
+    filters: sa.ColumnElement[bool] | t.Sequence[sa.ColumnElement[bool]],
+) -> sa.ColumnElement[bool]:
+    """Create a filter from a ColumnElement or a Sequence of ColumnElement."""
+    if isinstance(filters, sa.ColumnElement):
+        return filters
+    elif isinstance(filters, t.Sequence):
+        return sa.and_(*filters)
+    raise TypeError(
+        f"Expected a ColumnElement or Sequence of ColumnElement, got {type(filters)}"
+    )

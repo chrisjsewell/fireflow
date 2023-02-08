@@ -32,7 +32,8 @@ repos:
         additional_dependencies: [
           "types-aiofiles",
           "aiohttp",
-          "sqlalchemy==2.0.0rc2",
+          "sqlalchemy~=2.0",
           "jinja2",
           "typer[all]",
+          "pyparsing",
         ]
