@@ -36,4 +36,5 @@ repos:
           "jinja2",
           "typer[all]",
           "pyparsing",
+          "virtual-glob",
         ]

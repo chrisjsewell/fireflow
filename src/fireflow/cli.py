@@ -501,15 +501,13 @@ def code_list(
 def calcjob_show(
     ctx: typer.Context,
     pk: int = typer.Argument(..., help="Primary key of the calcjob to show"),
-    process: bool = typer.Option(
-        False, "--process", "-p", help="Show the process as well"
-    ),
+    no_process: bool = typer.Option(False, help="Don't show the process"),
 ) -> None:
     """Show a calcjob."""
     storage = ctx.ensure_object(StorageContext).storage
     calcjob = storage.get_row(orm.CalcJob, pk)
     console.print(calcjob)
-    if process:
+    if not no_process:
         console.print(calcjob.process)
 
 

@@ -8,18 +8,17 @@ import logging
 import os
 from pathlib import Path
 import posixpath
-from tempfile import TemporaryDirectory
 import time
 from typing import Any, BinaryIO, Sequence, TypedDict
-from urllib.parse import urlparse
 
 import aiofiles
 import aiohttp
 import firecrest
 from jinja2.environment import Template
+from virtual_glob import glob as vglob
 
-from fireflow.orm import CalcJob, DataNode, Processing
-from fireflow.patches import ls_recurse
+from fireflow._remote_path import RemotePath
+from fireflow.orm import CalcJob, Processing
 from fireflow.storage import Storage
 
 LOGGER = logging.getLogger(__name__)
@@ -98,9 +97,7 @@ async def run_step(process: Processing, storage: Storage) -> None:
         await poll_until_finished(calc)
         process.step = "retrieving"
     elif process.step == "retrieving":
-        with TemporaryDirectory() as out_tmpdir:
-            await copy_from_remote(calc, Path(out_tmpdir))
-            await parse_output_files(calc, Path(out_tmpdir))
+        await copy_from_remote(calc, storage)
         process.step = "finalised"
     else:
         raise ValueError(f"Unknown step name {process.step}")
@@ -211,73 +208,76 @@ async def poll_until_finished(
         raise RuntimeError("timeout waiting for calcjob to finish")
 
 
-async def copy_from_remote(calc: CalcJob, local_folder: Path) -> None:
+async def copy_from_remote(calc: CalcJob, storage: Storage) -> None:
     """Copy the calcjob outputs from the compute resource."""
-    # TODO this should take the calc.download_globs, and only copy those
-    # directly into the object storage
-    # before downloading, we can also get the checksum to see if it is already in the store
-    # once its in the store, then we want to update the calc process,
-    # to record the (POSIX) path we retrieved
-
     client_row = calc.code.client
     remote_folder = calc.remote_path
-    report(calc.pk, "copying from remote folder")
+    report(calc.pk, "downloading files from remote")
     client = client_row.client
-    for item in ls_recurse(
-        client, client_row.machine_name, str(remote_folder), show_hidden=True
-    ):
-        if item["type"] == "-":
-            remote_path = remote_folder / item["path"]
-            LOGGER.debug("copying from remote: %s", remote_path)
-            local_path = local_folder.joinpath(
-                *remote_path.relative_to(remote_folder).parts
-            )
-            local_path.parent.mkdir(parents=True, exist_ok=True)
-            if client_row.small_file_size_mb * 1024 * 1024 > int(item["size"]):
-                client.simple_download(
-                    client_row.machine_name, str(remote_path), str(local_path)
-                )
-                await reliquish()
-            else:
-                down_obj = client.external_download(
-                    client_row.machine_name, str(remote_path)
-                )
-                await poll_object_transfer(down_obj)
-
-                # here instead of using down_obj.finish_download
-                # we use an asynchoronous version of it
-                url = down_obj.object_storage_data
-
-                if os.environ.get("FIRECREST_LOCAL_TESTING"):
-                    # TODO however the url above doesn't work locally, with the demo docker
-                    # there was a fix already noted for MAC:url.replace("192.168.220.19", "localhost")
-                    # however, this still gives a 403 error:
-                    # "The request signature we calculated does not match the signature you provided.
-                    # Check your key and signing method.""
-                    # so for now, I'm just going to swap out the URL, with the actual location on disk
-                    # where the files are stored for the demo!
-                    store_path = (
-                        "/Users/chrisjsewell/Documents/GitHub/firecrest/deploy/demo/minio"
-                        + urlparse(url).path
+    vpath = RemotePath(client, client_row.machine_name, remote_folder, "d", 0)
+    # mapping of path to None (if directory) or file store key (if file)
+    paths: dict[str, None | str] = {}
+    for download_glob in calc.download_globs:
+        # TODO clarify handling of symlinks
+        vsubpath: RemotePath
+        for vsubpath in vglob(vpath, download_glob, follow_symlinks=False):
+            save_path = str(vsubpath.pure_path.relative_to(remote_folder))
+            if vsubpath.is_symlink():
+                continue
+            elif vsubpath.is_dir():
+                paths[save_path] = None
+            elif vsubpath.is_file():
+                checksum = client.checksum(client_row.machine_name, vsubpath.path)
+                if checksum in storage.objects:
+                    paths[save_path] = checksum
+                elif (
+                    vsubpath.size is not None
+                    and vsubpath.size <= client_row.small_file_size_mb * 1024 * 1024
+                ):
+                    io = BytesIO()
+                    client.simple_download(client_row.machine_name, vsubpath.path, io)
+                    key = storage.objects.add_from_bytes(
+                        io.getvalue(), vsubpath.pure_path.suffix.lstrip(".")
                     )
-                    await copy_file_async(store_path, local_path)
+                    if key != checksum:
+                        raise RuntimeError(
+                            f"checksum mismatch for downloaded file: {vsubpath}"
+                        )
+                    paths[save_path] = key
+                    await reliquish()
                 else:
-                    await download_url_to_file(url, local_path)
+                    # TODO big file download
+                    raise NotImplementedError("big file download")
+                    # down_obj = client.external_download(
+                    #     client_row.machine_name, str(remote_path)
+                    # )
+                    # await poll_object_transfer(down_obj)
 
-                # now invalidate the download object, since we no longer need it
-                down_obj.invalidate_object_storage_link()
+                    # # here instead of using down_obj.finish_download
+                    # # we use an asynchoronous version of it
+                    # url = down_obj.object_storage_data
 
+                    # if os.environ.get("FIRECREST_LOCAL_TESTING"):
+                    #     # TODO however the url above doesn't work locally, with the demo docker
+                    #     # there was a fix already noted for MAC:url.replace("192.168.220.19", "localhost")
+                    #     # however, this still gives a 403 error:
+                    #     # "The request signature we calculated does not match the signature you provided.
+                    #     # Check your key and signing method.""
+                    #     # so for now, I'm just going to swap out the URL, with the actual location on disk
+                    #     # where the files are stored for the demo!
+                    #     from urllib.parse import urlparse
+                    #     store_path = (
+                    #         "/Users/chrisjsewell/Documents/GitHub/firecrest/deploy/demo/minio"
+                    #         + urlparse(url).path
+                    #     )
+                    #     await copy_file_async(store_path, local_path)
+                    # else:
+                    #     await download_url_to_file(url, local_path)
 
-async def parse_output_files(calc: CalcJob, local_path: Path) -> None:
-    """Parse the calculation outputs."""
-    report(calc.pk, "parsing output files")
-    paths = []
-    for path in local_path.glob("**/*"):
-        paths.append(
-            path.relative_to(local_path).as_posix() + ("/" if path.is_dir() else "")
-        )
-    report(calc.pk, "paths: %s", paths)
-    DataNode(attributes={"paths": paths}, creator_pk=calc.pk)
+                    # # now invalidate the download object, since we no longer need it
+                    # down_obj.invalidate_object_storage_link()
+
+    calc.process.retrieved_paths = paths
 
 
 # HELPER functions

@@ -21,6 +21,7 @@ dependencies = [
     "sqlalchemy~=2.0",
     "jinja2",
     "pyyaml",
+    "virtual-glob",
 ]
 
 [project.optional-dependencies]

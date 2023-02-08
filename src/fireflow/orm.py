@@ -319,7 +319,7 @@ class Code(Base):
 
     label: Mapped[str] = mapped_column(default_factory=lambda: random.choice(NAMES))
 
-    upload_paths: Mapped[ImmutableDict[str, t.Optional[str]]] = mapped_column(
+    upload_paths: Mapped[t.Dict[str, t.Optional[str]]] = mapped_column(
         ImmutableDictType(), default_factory=ImmutableDict
     )
     """Paths to upload to the remote machine: {path: key},
@@ -361,16 +361,16 @@ class CalcJob(Base):
     uuid: Mapped[UUID] = mapped_column(default_factory=uuid4)
     """The unique identifier, for remote folder creation."""
 
-    parameters: Mapped[ImmutableDict[str, t.Any]] = mapped_column(
+    parameters: Mapped[t.Dict[str, t.Any]] = mapped_column(
         ImmutableDictType(), default_factory=ImmutableDict
     )
     """JSONable data to store on the node."""
 
-    upload_paths: Mapped[ImmutableDict[str, t.Optional[str]]] = mapped_column(
+    upload_paths: Mapped[t.Dict[str, t.Optional[str]]] = mapped_column(
         ImmutableDictType(), default_factory=ImmutableDict
     )
     """Paths to upload to the remote machine: {path: key},
-    relative to the work directory.
+    relative to the calcjob work directory.
 
     - `path` POSIX formatted path.
     - `key` pointing to the file in the object store, or None if a directory.
@@ -456,27 +456,45 @@ class Processing(Base):
     exception: Mapped[t.Optional[str]] = mapped_column(default=None)
     """The exception that was raised, if any."""
 
-
-class DataNode(Base):
-    """Data node to input or output from a calcjob."""
-
-    __tablename__ = "data"
-
-    attributes: Mapped[ImmutableDict[str, t.Any]] = mapped_column(
+    retrieved_paths: Mapped[t.Dict[str, t.Optional[str]]] = mapped_column(
         ImmutableDictType(), default_factory=ImmutableDict
     )
-    """JSONable data to store on the node."""
+    """Paths retrieved from the remote machine: {path: key},
+    relative to the calcjob work directory, after the job has finished.
+    These are collected based on the `CalcJob.download_globs` attribute.
 
-    creator_pk: Mapped[t.Optional[int]] = mapped_column(
-        # don't allow calcjob to be deleted if there are data associated with it
-        sa.ForeignKey("calcjob.pk", ondelete="RESTRICT"),
-        default=None,
-    )
-    """The primary key of the calcjob that created this node."""
-    creator: Mapped[t.Optional[CalcJob]] = relationship(
-        init=False, repr=False, default=None
-    )
-    """The calcjob that created this node."""
+    - `path` POSIX formatted path.
+    - `key` pointing to the file in the object store, or None if a directory.
+    """
+
+    @validates("retrieved_paths")
+    def _validate_retrieved_paths(self, key: str, value: t.Any) -> t.Any:
+        """Validate the upload paths."""
+        _validate_virtual_fs(key, value)
+        return value
+
+
+# TODO we don't actually use this yet
+# class DataNode(Base):
+#     """Data node to input or output from a calcjob."""
+
+#     __tablename__ = "data"
+
+#     attributes: Mapped[t.Dict[str, t.Any]] = mapped_column(
+#         ImmutableDictType(), default_factory=ImmutableDict
+#     )
+#     """JSONable data to store on the node."""
+
+#     creator_pk: Mapped[t.Optional[int]] = mapped_column(
+#         # don't allow calcjob to be deleted if there are data associated with it
+#         sa.ForeignKey("calcjob.pk", ondelete="RESTRICT"),
+#         default=None,
+#     )
+#     """The primary key of the calcjob that created this node."""
+#     creator: Mapped[t.Optional[CalcJob]] = relationship(
+#         init=False, repr=False, default=None
+#     )
+#     """The calcjob that created this node."""
 
 
 NAMES: t.Tuple[str, ...] = (
