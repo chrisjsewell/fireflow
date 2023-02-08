@@ -317,6 +317,9 @@ class Code(Base):
 
     """
 
+    script_filename: t.ClassVar[str] = "job-script.sh"
+    """What to name the generated script on the remote machine."""
+
     label: Mapped[str] = mapped_column(default_factory=lambda: random.choice(NAMES))
 
     upload_paths: Mapped[t.Dict[str, t.Optional[str]]] = mapped_column(

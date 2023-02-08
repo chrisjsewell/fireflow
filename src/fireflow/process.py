@@ -19,7 +19,7 @@ from virtual_glob import glob as vglob
 
 from fireflow._remote_path import RemotePath
 from fireflow.object_store import ObjectStore
-from fireflow.orm import CalcJob, Processing
+from fireflow.orm import CalcJob, Code, Processing
 from fireflow.storage import Storage
 
 LOGGER = logging.getLogger(__name__)
@@ -30,9 +30,6 @@ logging.addLevelName(REPORT_LEVEL, "REPORT")
 def report(pk: int, msg: str, *args: Any) -> None:
     """Report on the calcjob process."""
     LOGGER.log(REPORT_LEVEL, f"PK-{pk}: " + str(msg), *args)
-
-
-JOB_NAME = "job.sh"
 
 
 def run_unfinished_calcjobs(storage: Storage, limit: None | int = None) -> None:
@@ -141,7 +138,10 @@ async def copy_to_remote(calc: CalcJob, ostore: ObjectStore) -> None:
         .encode("utf-8")
     )
     client.simple_upload(
-        client_row.machine_name, BytesIO(job_script), str(remote_folder), JOB_NAME
+        client_row.machine_name,
+        BytesIO(job_script),
+        str(remote_folder),
+        Code.script_filename,
     )
     await reliquish()
 
@@ -189,7 +189,7 @@ async def copy_to_remote(calc: CalcJob, ostore: ObjectStore) -> None:
 async def submit_on_remote(calc: CalcJob, ostore: ObjectStore) -> None:
     """Run the calcjob on the compute resource."""
     client_row = calc.code.client
-    script_path = calc.remote_path / JOB_NAME
+    script_path = calc.remote_path / Code.script_filename
     report(calc.pk, "submitting on remote")
     client = client_row.client
     result = client.submit(client_row.machine_name, str(script_path), local_file=False)
@@ -227,6 +227,11 @@ async def copy_from_remote(calc: CalcJob, ostore: ObjectStore) -> None:
         vsubpath: RemotePath
         for vsubpath in vglob(vpath, download_glob, follow_symlinks=False):
             save_path = str(vsubpath.pure_path.relative_to(remote_folder))
+            if save_path == Code.script_filename:
+                # never download the script file, since we can already generate it
+                # and so it would just be a waste of space
+                # (especially since they will all be different, if using the calcjob uuid)
+                continue
             if vsubpath.is_symlink():
                 continue
             elif vsubpath.is_dir():
