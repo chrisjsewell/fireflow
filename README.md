@@ -1,4 +1,4 @@
-# firecrest-workflows
+# fireflow
 
 A simple async workflow engine for interfacing with [FirecREST](https://products.cscs.ch/firecrest/).
 
