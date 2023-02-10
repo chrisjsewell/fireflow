@@ -6,12 +6,10 @@ from io import BytesIO
 from itertools import chain
 import logging
 import os
-from pathlib import Path
 import posixpath
 import time
 from typing import Any, BinaryIO, Sequence, TypedDict
 
-import aiofiles
 import aiohttp
 import firecrest
 from virtual_glob import glob as vglob
@@ -249,53 +247,50 @@ async def copy_from_remote(calc: CalcJob, ostore: ObjectStore) -> None:
                     paths[save_path] = key
                     await reliquish()
                 else:
-                    # TODO big file download
-                    raise NotImplementedError("big file download")
-                    # down_obj = client.external_download(
-                    #     client_row.machine_name, str(remote_path)
-                    # )
-                    # await poll_object_transfer(down_obj)
+                    down_obj = client.external_download(
+                        client_row.machine_name, vsubpath.path
+                    )
+                    await poll_object_transfer(down_obj)
 
-                    # # here instead of using down_obj.finish_download
-                    # # we use an asynchoronous version of it
-                    # url = down_obj.object_storage_data
+                    # here instead of using down_obj.finish_download
+                    # we use an asynchoronous version of it
+                    url = down_obj.object_storage_data
 
-                    # if os.environ.get("FIRECREST_LOCAL_TESTING"):
-                    #     # TODO however the url above doesn't work locally, with the demo docker
-                    #     # there was a fix already noted for MAC:url.replace("192.168.220.19", "localhost")
-                    #     # however, this still gives a 403 error:
-                    #     # "The request signature we calculated does not match the signature you provided.
-                    #     # Check your key and signing method.""
-                    #     # so for now, I'm just going to swap out the URL, with the actual location on disk
-                    #     # where the files are stored for the demo!
-                    #     from urllib.parse import urlparse
-                    #     store_path = (
-                    #         "/Users/chrisjsewell/Documents/GitHub/firecrest/deploy/demo/minio"
-                    #         + urlparse(url).path
-                    #     )
-                    #     await copy_file_async(store_path, local_path)
-                    # else:
-                    #     await download_url_to_file(url, local_path)
+                    if os.environ.get("FIRECREST_LOCAL_TESTING"):
+                        # TODO however the url above doesn't work locally, with the demo docker
+                        # there was a fix already noted for MAC:url.replace("192.168.220.19", "localhost")
+                        # however, this still gives a 403 error:
+                        # "The request signature we calculated does not match the signature you provided.
+                        # Check your key and signing method.""
+                        # so for now, I'm just going to swap out the URL, with the actual location on disk
+                        # where the files are stored for the demo!
+                        from urllib.parse import urlparse
 
-                    # # now invalidate the download object, since we no longer need it
-                    # down_obj.invalidate_object_storage_link()
+                        store_path = (
+                            "/Users/chrisjsewell/Documents/GitHub/firecrest/deploy/demo/minio"
+                            + urlparse(url).path
+                        )
+                        key = ostore.add_from_path(store_path)
+                        if key != checksum:
+                            raise RuntimeError(
+                                f"checksum mismatch for downloaded file: {vsubpath}"
+                            )
+                        paths[save_path] = key
+                        await reliquish()
+                    else:
+                        async with aiohttp.ClientSession() as session:
+                            async with session.get(url) as resp:
+                                with ostore.open_for_write() as writer:
+                                    while True:
+                                        chunk = await resp.content.read(1024)
+                                        if not chunk:
+                                            break
+                                        writer.write(chunk)
+
+                    # now invalidate the download object, since we no longer need it
+                    down_obj.invalidate_object_storage_link()
 
     calc.process.retrieved_paths = paths
-
-
-# HELPER functions
-
-
-async def copy_file_async(src: str | Path, dest: str | Path) -> None:
-    """Copy a file asynchronously."""
-    async with aiofiles.open(src, mode="rb") as fr, aiofiles.open(
-        dest, mode="wb"
-    ) as fw:
-        while True:
-            chunk = await fr.read(1024)
-            if not chunk:
-                break
-            await fw.write(chunk)
 
 
 class UploadParameters(TypedDict):
@@ -326,15 +321,3 @@ async def upload_io_to_url(
             params=params["params"],
         ) as resp:
             return await resp.text()
-
-
-async def download_url_to_file(url: str, filepath: Path | str) -> None:
-    """Download a file from a URL to a local file."""
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url) as resp:
-            with open(filepath, "wb") as f:
-                while True:
-                    chunk = await resp.content.read(1024)
-                    if not chunk:
-                        break
-                    f.write(chunk)

@@ -5,19 +5,12 @@ from abc import ABC, abstractmethod
 from contextlib import closing
 import hashlib
 from io import BytesIO
+import os
 from pathlib import Path
-import shutil
 import tempfile
-from typing import BinaryIO, Iterable, Protocol
+from typing import Any, BinaryIO, Iterable, Protocol, TypeVar
 
 COPY_BUFSIZE = 64 * 1024
-
-
-class BinaryStream(Protocol):
-    """A binary stream, that can be read once and only once, optionally in chunks."""
-
-    def read(self, size: int = -1) -> bytes:
-        """Read the stream."""
 
 
 class ObjectStore(ABC):
@@ -90,10 +83,106 @@ class ObjectStore(ABC):
 
     @abstractmethod
     def open(self, sha256: str) -> BinaryIO:
-        """Open the object for reading.
+        """Return a file reader for the object.
 
         :raises KeyError: if the object is not in the store.
         """
+
+    def open_for_write(self) -> ObjectWriter:
+        """Return a writer to the store, for a single object.
+
+        The writes will be idempotent and atomic,
+        such that writing can only happen once, inside the context,
+        and the object will be placed in the store only if the context exits successfully.
+        """
+        # TODO do we want an async version of this? (e.g. using aiofiles)
+        return DefaultObjectWriter(self)
+
+
+class BinaryStream(Protocol):
+    """A binary stream, that can be read once and only once, optionally in chunks."""
+
+    def read(self, size: int = -1) -> bytes:
+        """Read the stream."""
+
+
+# TODO replace with Self type for Python 3.10
+_Self1 = TypeVar("_Self1", bound="ObjectWriter")
+_Self2 = TypeVar("_Self2", bound="DefaultObjectWriter")
+_Self3 = TypeVar("_Self3", bound="FileObjectWriter")
+
+
+class ObjectWriter(ABC):
+    """A context for writing objects to the store,
+    that can be used to write a single object to the store.
+    """
+
+    @abstractmethod
+    def __enter__(self: _Self1) -> _Self1:
+        """Enter the context for writing.
+
+        :raises ValueError: if the writer has already been closed.
+        """
+
+    @abstractmethod
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: Any,
+    ) -> None:
+        """Exit the context, and place the object in the object store."""
+
+    @abstractmethod
+    def write(self, data: bytes) -> None:
+        """Write data to the file.
+
+        :raises ValueError: if the writer is not in the context.
+        """
+
+    @property
+    @abstractmethod
+    def key(self) -> None | str:
+        """Get the key of the object that was written."""
+
+
+_T2 = TypeVar("_T2", bound="DefaultObjectWriter")
+
+
+class DefaultObjectWriter(ObjectWriter):
+    def __init__(self, store: ObjectStore) -> None:
+        self._store = store
+        self._key: str | None = None
+        self._data: bytes = b""
+        self._open: None | bool = (
+            None  # None before entering, True after, False after exiting
+        )
+
+    @property
+    def key(self) -> None | str:
+        return self._key
+
+    def __enter__(self: _Self2) -> _Self2:
+        if self._open is False:
+            raise ValueError("Writer already closed")
+        self._open = True
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: Any,
+    ) -> None:
+        self._open = False
+        if exc_type is not None or not self._data:
+            return
+        self._key = self._store.add_from_bytes(self._data)
+
+    def write(self, data: bytes) -> None:
+        if self._open is not True:
+            raise ValueError("Writer not in context")
+        self._data += data
 
 
 class InMemoryObjectStore(ObjectStore):
@@ -175,13 +264,8 @@ class FileObjectStore(ObjectStore):
         if path.exists():
             Path(temp.name).unlink()
             return sha256
-
-        try:
-            shutil.move(temp.name, path)
-        except Exception:
-            if path.exists():
-                path.unlink()
-            raise
+        else:
+            os.rename(temp.name, path)
         return sha256
 
     def __contains__(self, sha256: str) -> bool:
@@ -200,3 +284,61 @@ class FileObjectStore(ObjectStore):
     def open(self, sha256: str) -> BinaryIO:
         path = self._get_path(sha256)
         return path.open("rb")
+
+    def open_for_write(self) -> ObjectWriter:
+        return FileObjectWriter(self._path)
+
+
+class FileObjectWriter(ObjectWriter):
+    def __init__(self, path: str | Path) -> None:
+        self._path = Path(path)
+        self._key: str | None = None
+        self._open: None | bool = (
+            None  # None before entering, True after, False after exiting
+        )
+        self._hasher: Any | None = None  # TODO type of hasher?
+        self._file: BinaryIO | None = None
+
+    @property
+    def key(self) -> str | None:
+        return self._sha256
+
+    def __enter__(self: _Self3) -> _Self3:
+        if self._open is False:
+            raise ValueError("Writer already closed")
+        if self._open is True:
+            return self
+        self._open = True
+        self._hasher = hashlib.sha256()
+        self._file = tempfile.NamedTemporaryFile("wb", delete=False)  # type: ignore[assignment]
+        return self
+
+    def write(self, obj: bytes) -> None:
+        assert self._file is not None
+        assert self._hasher is not None
+        self._hasher.update(obj)
+        self._file.write(obj)
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: Any,
+    ) -> None:
+        self._open = False
+        try:
+            if exc_type is None:
+
+                assert self._hasher is not None
+                sha256: str = self._hasher.hexdigest()
+                path = self._path / sha256
+
+                if not path.exists():
+                    assert self._file is not None
+                    os.rename(self._file.name, path)
+        finally:
+            if self._file and Path(self._file.name).exists():
+                Path(self._file.name).unlink()
+            self._sha256 = sha256
+            self._file = None
+            self._hasher = None
