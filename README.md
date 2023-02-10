@@ -284,6 +284,7 @@ Processing(
 
 - Using typer (built on top of click) for the CLI
 - Updating to sqlalchemy v2, and using its declaratively mapped dataclasses
+- Use the `--where` flag syntax for filtering
 - Using <https://github.com/chrisjsewell/virtual-glob>, and the idea of `download_globs`
 - Downloading files, from the remote, directly (and asynchronously) to the object store
 - Print the job script, for debugging
